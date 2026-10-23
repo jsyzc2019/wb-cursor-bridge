@@ -1,0 +1,56 @@
+{
+  "name": "wb-cursor-bridge",
+  "version": "0.4.0",
+  "description": "MCP bridge that exposes the Cursor CLI as a governed sub-agent to WorkBuddy.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "bin": {
+    "wb-cursor-bridge": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "node -e \"fs.rmSync('dist',{recursive:true,force:true});fs.rmSync('release',{recursive:true,force:true})\"",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "npm run build",
+    "test": "node --test test/unit.test.mjs test/e2e.test.mjs test/admin.test.mjs test/a2a.test.mjs",
+    "test:unit": "node --test test/unit.test.mjs",
+    "test:e2e": "node --test test/e2e.test.mjs",
+    "test:admin": "node --test test/admin.test.mjs",
+    "test:a2a": "node --test test/a2a.test.mjs",
+    "test:stress": "node --test test/stress.test.mjs",
+    "test:fault": "node --test test/fault.test.mjs",
+    "verify:e2e": "node scripts/e2e-empirical.mjs",
+    "build:release": "npm run build && node scripts/build-release.mjs",
+    "start": "node dist/index.js",
+    "verify": "npm run typecheck && npm test && npm run test:stress && npm run test:fault && npm run build:release"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "a2a",
+    "agent2agent",
+    "agent",
+    "cursor",
+    "codebuddy",
+    "workbuddy",
+    "bridge"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,42 @@
+name: real-cursor-snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      cursorBin:
+        description: 'Full path to the Cursor CLI (agent.exe)'
+        required: true
+        type: string
+      workspaceRoots:
+        description: 'Semicolon-separated workspace roots'
+        required: true
+        type: string
+      nodeVersion:
+        description: 'Node version for the runner'
+        required: false
+        default: '22'
+        type: string
+
+jobs:
+  snapshot:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.nodeVersion }}
+      - run: npm ci
+      - run: npm run build
+      - name: Run snapshot against real Cursor CLI
+        shell: pwsh
+        run: |
+          $roots = '${{ inputs.workspaceRoots }}' -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+          foreach ($r in $roots) {
+            if (-not (Test-Path $r -PathType Container)) {
+              throw "Workspace root does not exist: $r"
+            }
+          }
+          $env:CURSOR_BIN = '${{ inputs.cursorBin }}'
+          $env:CURSOR_BRIDGE_WORKSPACE_ROOTS = '${{ inputs.workspaceRoots }}'
+          $env:CURSOR_BRIDGE_LOG_LEVEL = "info"
+          node --test test/e2e.test.mjs

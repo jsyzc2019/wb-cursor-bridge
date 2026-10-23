@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run verify
+      - name: End-to-end real-run empirical (real dist binary + fake-agent)
+        run: npm run verify:e2e
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run build
+      - name: Create Windows fake-agent shim
+        shell: cmd
+        run: |
+          echo @echo off > test\fake-agent.cmd
+          echo node "%%~dp0fake-agent.mjs" %%* >> test\fake-agent.cmd
+      - name: Run Node tests with fake agent
+        shell: pwsh
+        run: |
+          $env:CURSOR_BIN = "$pwd\test\fake-agent.cmd"
+          $env:CURSOR_BRIDGE_LOG_LEVEL = "error"
+          node --test test/unit.test.mjs test/e2e.test.mjs test/admin.test.mjs
+      - name: Run PowerShell MCP config tests
+        shell: pwsh
+        run: pwsh -File test/mcp-config.test.ps1
+      - name: Build release package
+        shell: pwsh
+        run: npm run build:release
