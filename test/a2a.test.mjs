@@ -13,10 +13,9 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, writeFileSync, rmSync, chmodSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, chmodSync, mkdirSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { JobManager } from '../dist/runner.js';
@@ -24,8 +23,9 @@ import { Logger } from '../dist/logger.js';
 import { startA2AServer } from '../dist/a2a/server.js';
 import { VERSION } from '../dist/version.js';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const FAKE = path.join(ROOT, 'test', 'a2a-fake-agent.mjs');
+import { fakeBin } from './fake-bin.mjs';
+
+const FAKE = fakeBin('a2a');
 
 // The bridge spawns the fake agent as a real executable, so it must be
 // executable for the whole suite. Do this once at import time.
@@ -623,14 +623,37 @@ test('a2a(P2): /healthz /metrics /version endpoints and message/send role guard'
 
 /* ---------------------------------------------------- Phase 3 #20: worktree cleanup on crash */
 
-/** Leftover worktree directories under stateDir/worktrees, if any. */
+/**
+ * Worktree directories still on disk, as `<instanceId>/<worktree>`.
+ *
+ * Layout since 0.4.2 is `<stateDir>/worktrees/<instanceId>/<worktree>/`, and the
+ * instance directory legitimately stays for the lifetime of the process — so
+ * counting entries of `worktrees/` would always be non-empty, and filtering by
+ * a `wb-` prefix (the pre-0.4.2 naming) would always be empty. Walk one level
+ * deeper instead, skipping the `owner.json` stamp.
+ */
 function leftoverWorktrees(stateDir) {
-  const dir = path.join(stateDir, 'worktrees');
+  const root = path.join(stateDir, 'worktrees');
+  const out = [];
+  let instances;
   try {
-    return fs.readdirSync(dir).filter((e) => e.startsWith('wb-'));
+    instances = readdirSync(root, { withFileTypes: true });
   } catch {
-    return [];
+    return out;
   }
+  for (const inst of instances) {
+    if (!inst.isDirectory()) continue;
+    let entries;
+    try {
+      entries = readdirSync(path.join(root, inst.name), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) out.push(`${inst.name}/${e.name}`);
+    }
+  }
+  return out;
 }
 
 test('a2a(P3#20): a crashed agent does not leak its git worktree', async () => {

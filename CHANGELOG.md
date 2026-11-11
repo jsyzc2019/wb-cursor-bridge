@@ -4,6 +4,59 @@
 `src/version.ts` 是版本号的唯一来源，测试会断言其与 `package.json` 一致——
 版本不一致无法通过测试，因此不可能发出版本号错乱的包。
 
+## 0.4.3 — 工程门禁：lint / 发布前校验 / Windows 全量测试
+
+全仓测试 **129 → 130** 项，`verify` 与 `prepublishOnly` 都先过 lint。这一版不改运行时
+语义（除下面那处 Windows 启动分支），补的是"能让这些问题被机器发现"的门禁。
+
+### 新增：ESLint 门禁
+
+`eslint.config.mjs` 接入 flat config，只启用偏正确性的规则（未使用绑定、松散相等、`var`、
+应 `const` 却 `let`、未定义全局），不引入会和现有代码风格打架的格式化规则。
+
+首次运行就抓到 **12 error**，其中 3 处是真问题而不是风格：
+
+- `src/a2a/watch.ts`：`lastArtifactCount` 只赋值从未读取，属死代码，删除。
+- `test/a2a.test.mjs`：`leftoverWorktrees()` 调用 `fs.readdirSync` 但从未导入 `fs`，
+  `ReferenceError` 被外层 `catch` 吞掉，**断言永远看到空数组**——见下。
+- `test/a2a.test.mjs`：0.4.2 把 worktree 改成 `<stateDir>/worktrees/<instanceId>/` 后，
+  该函数仍按旧的 `wb-` 前缀过滤，即使不抛错也永远匹配不到。
+
+### 修复：一个从 0.4.2 起就空转的 worktree 泄漏断言
+
+`a2a(P3#20): a crashed agent does not leak its git worktree` 一直在"通过"，但它检查的是
+一个恒为空的数组：`fs` 未导入 → 抛错 → `catch { return [] }`。0.4.2 改了目录层级后，
+即使导入正确，前缀过滤也只会返回空。
+
+现在按 `worktrees/<instanceId>/<worktree>` 走一层，跳过 `owner.json`。并做变异验证：
+人为在断言前创建一个残留目录，用例**如期失败**（`actual` 里出现 `probe-inst/probe-wt`），
+证明它不再是摆设。
+
+### 新增：`prepublishOnly`
+
+`npm publish` / 打包前强制 `lint + typecheck + npm test`。此前 `bin` 指向 `dist/` 而
+`dist/` 不入库，漏构建会发出一个装完就跑不起来的包。
+
+### 修复：Windows 上测试跑不起来（`.cmd` 无法无 shell 启动）
+
+Node 18.20.2+ 起，`spawn()` 一个 `.cmd`/`.bat` 且未开 `shell` 会直接 `EINVAL`
+（CVE-2024-27980）；`execFile()` 同样不行。原 CI 的做法是"临时生成 `test/fake-agent.cmd`，
+把 `CURSOR_BIN` 指过去"，因此 Windows 上只能跑 unit/e2e/admin，a2a/stress/fault 一直缺席。
+
+- 新增 `resolveSpawnTarget()`：Windows 上若 `CURSOR_BIN` 指向 `.js`/`.mjs`，改用当前
+  Node 执行该脚本；其余情况（含生产的 `agent.exe`）保持直接 spawn。
+  **不启用 shell**——prompt 是 argv，走 shell 会把 `&`、`^` 变成命令注入。
+- 测试统一经 `test/fake-bin.mjs` 取假 Agent 路径：POSIX 用 `.sh`（shebang + exec 位），
+  Windows 用 `.mjs`。
+- CI 的 Windows job 改为跑 `npm test`（含 a2a、hardening）+ `test:stress` + `test:fault`，
+  不再内联生成 shim。
+- `.gitattributes` 固定 `*.sh` 为 LF（CRLF shebang 在 POSIX 上无法执行）。
+
+### 顺带
+
+- `test/client.mjs`：把 `cond ? a() : b()` 的三元语句改成 `if/else`（lint 的
+  `no-unused-expressions`），行为不变。
+
 ## 0.4.2 — 配置严格化 + CORS 凭证收敛 + 多实例共存
 
 全仓测试 **110 → 129** 项（68 单元 + 5 硬化 + 20 端到端 + 3 admin + 33 A2A），

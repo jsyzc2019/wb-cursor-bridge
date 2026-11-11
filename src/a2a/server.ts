@@ -19,7 +19,7 @@ import type { JobManager } from '../runner.js';
 import type { Config } from '../config.js';
 import type { Logger } from '../logger.js';
 import type { Job, Tier } from '../types.js';
-import { badArgument, concurrency, notFound } from '../errors.js';
+import { badArgument, notFound } from '../errors.js';
 import { buildAgentCard, AGENT_OUTPUT_MODES } from './card.js';
 import { toV1Card, isV1, type A2AVersion } from './compat.js';
 import { deriveSkills, resolveRoot, type SkillEntry } from './skills.js';

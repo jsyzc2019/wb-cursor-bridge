@@ -175,7 +175,7 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 
 | 键 / 环境变量 | 默认 | 说明 |
 |---|---|---|
-| `cursorBin` / `CURSOR_BIN` | `agent.exe` | Cursor CLI 路径 |
+| `cursorBin` / `CURSOR_BIN` | `agent.exe` | Cursor CLI 路径。Windows 上若指向 `.js`/`.mjs`，会改用当前 Node 执行该脚本（不经过 shell），便于用脚本替身做联调；`.cmd`/`.bat` 无法被无 shell 启动，会直接失败 |
 | `workspaceRoots` / `CURSOR_BRIDGE_WORKSPACE_ROOTS` | 空 | 允许的仓库根，`;` 分隔；为空则**所有任务被拒** |
 | `stateDir` / `CURSOR_BRIDGE_STATE_DIR` | `%LOCALAPPDATA%\wb-cursor-bridge` | 索引、日志、产物 |
 | `defaultTimeoutSec` / `CURSOR_BRIDGE_TIMEOUT_SEC` | `900` | 单任务墙钟上限 |
@@ -218,16 +218,16 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 
 ```bash
 npm install
+npm run lint             # ESLint（correctness 规则；0 error 才放行）
 npm run typecheck        # tsc --noEmit
-npm test                 # 129 项：68 单元 + 5 硬化 + 20 端到端 + 3 admin HTTP + 33 A2A
+npm test                 # 130 项：69 单元 + 5 硬化 + 20 端到端 + 3 admin HTTP + 33 A2A
 npm run test:stress      # 压力：高并发 / 反复 cancel-reply / hang 超时
 npm run test:fault       # 故障：磁盘/权限异常的优雅降级
-npm run verify           # 门禁：typecheck + npm test + stress + fault + release 构建
-npm run test:a2a         # 仅跑 A2A 互操作 30 项（Agent Card / message/send / tasks/get / cancel / stream / push / auth / blocking / 协商 / 限流 / CORS / v1.0 / skills）
-npm run verify:e2e       # 端到端真跑实证：真实 dist 二进制 + fake-agent，54 项（v0.3.0/v1.0/鉴权/限流/CORS/产物可达/input-required 续跑/push 真投 + SSRF 拒绝/tasks/cancel 真实取消与清理/崩溃清理…），已纳入 Linux CI 门禁（脚本已跨平台可跑，Windows CI 待验证后启用）
+npm run test:a2a         # 仅跑 A2A 互操作（Agent Card / message/send / tasks/get / cancel / stream / push / auth / blocking / 协商 / 限流 / CORS / v1.0 / skills）
+npm run verify           # 门禁：lint + typecheck + npm test + stress + fault + release 构建
+npm run verify:e2e       # 端到端真跑实证：真实 dist 二进制 + fake-agent，54 项（v0.3.0/v1.0/鉴权/限流/CORS/产物可达/input-required 续跑/push 真投 + SSRF 拒绝/tasks/cancel 真实取消与清理/崩溃清理…）；Linux 与 Windows CI 均执行
 npm run build            # 编译到 dist/
 npm run build:release    # 产出 release/wb-cursor-bridge-v<version>-win-x64.zip
-npm run verify           # 上述全流程（不含 stress/fault）
 ```
 
 端到端测试用一个模拟 `agent` 二进制（`test/fake-agent.mjs`）讲同一种 stream-json 协议，因此**无需 Cursor 账号或网络**即可验证全链路。真实 Cursor CLI 集成见下文。
@@ -292,6 +292,7 @@ scripts/
 
 | 版本 | 要点 |
 |---|---|
+| **0.4.3** | 工程门禁：ESLint 接入 `verify`/`prepublishOnly`；Windows CI 补齐 a2a/stress/fault（新增 `resolveSpawnTarget`，Windows 上以当前 Node 执行 `.mjs` 假 Agent，绕开 `.cmd` 无法无 shell spawn 的限制）；修掉一个一直空转的 worktree 泄漏断言，130 项测试 |
 | **0.4.2** | 非法配置不再静默回退（`=15m` 以前会变成 900s）、CORS 通配不再授予凭证、多实例共享 stateDir 不再互删 worktree（`worktrees/<instanceId>/` + `owner.json`，`index.json` 记 owner 避免误判孤儿），129 项测试 |
 | **0.4.1** | 修复 `input-required` 暂停期丢失已写文件（续跑前自动回放暂停时的 patch，失败则 fail closed 而非在残缺树上继续）+ patch 产物持久化（桥重启后仍可续跑）+ `captureDiff --binary` + 续跑拒绝静默换档 + 流式缓冲硬上限 + blocking 断连不再空转，110 项测试 |
 | **0.4.0** | A+ 路线图收尾：消费 `configuration.blocking`/`acceptedOutputModes`/`historyLength`、JSON-RPC 通知不回包、令牌桶限流、CORS、`unhandledRejection` 阈值退出、`bridge_shutdown` flush、worktree `try/finally` 清理、`src/artifacts.ts` 解耦、skill 多扩展点、**A2A v1.0 迁移路线**（`compat.ts` 双版本序列化），97 项测试 |

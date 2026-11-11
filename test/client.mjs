@@ -30,7 +30,8 @@ export function createClient(env = {}) {
     if (msg.id !== undefined && pending.has(msg.id)) {
       const { resolve, reject } = pending.get(msg.id);
       pending.delete(msg.id);
-      msg.error ? reject(new Error(JSON.stringify(msg.error))) : resolve(msg.result);
+      if (msg.error) reject(new Error(JSON.stringify(msg.error)));
+      else resolve(msg.result);
     }
   });
   proc.stderr.on('data', (d) => stderr.push(d.toString('utf8')));

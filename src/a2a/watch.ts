@@ -71,8 +71,7 @@ export async function* subscribeTask(
 ): AsyncGenerator<TaskEvent> {
   let lastState: TaskState | undefined;
   let lastCursor = -1;
-  let lastArtifactCount = 0;
-  let emittedArtifactFor: Set<string> = new Set();
+  const emittedArtifactFor: Set<string> = new Set();
 
   const done = () => signal?.aborted ?? false;
 
@@ -82,7 +81,6 @@ export async function* subscribeTask(
   if (snap) {
     lastState = snap.state;
     lastCursor = snap.cursor;
-    lastArtifactCount = snap.artifactCount;
     yield statusEvent(snap, isFinalState(snap.state));
     for (const a of snap.task.artifacts ?? []) {
       emittedArtifactFor.add(a.artifactId);
@@ -123,7 +121,6 @@ export async function* subscribeTask(
         yield artifactEvent(snap, a, false, true);
       }
     }
-    lastArtifactCount = snap.artifactCount;
 
     if (isFinalState(snap.state)) return;
   }

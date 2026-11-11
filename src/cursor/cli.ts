@@ -128,6 +128,27 @@ export function extractNeedInput(text: string): { result: string; needInput?: st
   return { result: before, needInput: question };
 }
 
+/**
+ * Decide what to actually spawn for `cfg.cursorBin`.
+ *
+ * Windows cannot execute a JS file directly, and Node refuses to spawn a
+ * `.cmd`/`.bat` without `shell: true` (CVE-2024-27980). Enabling a shell here is
+ * not an option: the prompt travels as an argv and a shell would re-parse it,
+ * turning `&` or `^` into command injection. Running a JS entry through the
+ * current Node binary keeps the no-shell guarantee, and is what lets a
+ * script-based fake agent stand in for `agent.exe` on Windows.
+ */
+export function resolveSpawnTarget(
+  bin: string,
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+): { command: string; args: string[] } {
+  if (platform === 'win32' && /\.(?:mjs|cjs|js)$/i.test(bin)) {
+    return { command: process.execPath, args: [bin, ...args] };
+  }
+  return { command: bin, args };
+}
+
 /** Run one Cursor invocation to completion. */
 export async function runCursor(
   cfg: Config,
@@ -138,12 +159,13 @@ export async function runCursor(
   const started = Date.now();
   const worktreeName = `wb-${randomUUID().slice(0, 8)}`;
   const args = buildArgs(cfg, opts, worktreeName);
+  const target = resolveSpawnTarget(cfg.cursorBin, args);
 
   cb.onEvent({ type: 'start', text: cfg.cursorBin, detail: { args, timeoutSec: opts.timeoutSec, tier: opts.tier } });
 
   const proc: ChildProcessByStdio<null, Readable, Readable> = spawn(
-    cfg.cursorBin,
-    args,
+    target.command,
+    target.args,
     {
       cwd: opts.workspace,
       windowsHide: true,
@@ -160,7 +182,7 @@ export async function runCursor(
     },
   );
 
-  let pid: number | undefined = proc.pid;
+  const pid: number | undefined = proc.pid;
   let result = '';
   let resultChars = 0;
   let truncated = false;

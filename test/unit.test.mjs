@@ -11,7 +11,14 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 import { NdjsonReader } from '../dist/util/ndjson.js';
 import { parseStreamLine, describeTool } from '../dist/cursor/parse.js';
 import { isInside, canonical, assertWorkspaceAllowed, splitRoots } from '../dist/util/paths.js';
-import { buildArgs, tierArgs, capText, extractNeedInput, NEED_INPUT_MARKER } from '../dist/cursor/cli.js';
+import {
+  buildArgs,
+  tierArgs,
+  capText,
+  extractNeedInput,
+  resolveSpawnTarget,
+  NEED_INPUT_MARKER,
+} from '../dist/cursor/cli.js';
 import { JobStore } from '../dist/store.js';
 
 /* ------------------------------------------------------------------ paths */
@@ -115,6 +122,24 @@ test('splitRoots: splits on ; and on : only where it is safe', () => {
 });
 
 /* ----------------------------------------------------------------- ndjson */
+
+test('cli: a JS CURSOR_BIN runs through node on Windows, never through a shell', () => {
+  const bin = 'C:\\tools\\fake-agent.mjs';
+  const args = ['-p', 'rename a & b', '--output-format', 'stream-json'];
+
+  const win = resolveSpawnTarget(bin, args, 'win32');
+  assert.equal(win.command, process.execPath, 'Windows must not exec a .mjs directly');
+  assert.deepEqual(win.args, [bin, ...args], 'the script path goes first, argv untouched');
+
+  // A real .exe (what production uses) is spawned as-is.
+  const exe = resolveSpawnTarget('C:\\tools\\agent.exe', args, 'win32');
+  assert.equal(exe.command, 'C:\\tools\\agent.exe');
+  assert.deepEqual(exe.args, args);
+
+  // POSIX keeps the direct spawn, including the shebang-based .sh shim.
+  const posix = resolveSpawnTarget('/usr/bin/agent', args, 'linux');
+  assert.deepEqual(posix, { command: '/usr/bin/agent', args });
+});
 
 test('NdjsonReader: reassembles lines split across chunks', () => {
   const r = new NdjsonReader();

@@ -16,11 +16,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createClient, waitFor } from './client.mjs';
+import { fakeBin } from './fake-bin.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const FAKE = process.platform === 'win32'
-  ? path.join(ROOT, 'test', 'fake-agent.cmd')
-  : path.join(ROOT, 'test', 'fake-agent.sh');
+const FAKE = fakeBin('cursor');
 
 function makeRepo() {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'wbrepo-'));

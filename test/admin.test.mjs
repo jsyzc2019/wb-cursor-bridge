@@ -13,6 +13,8 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
+import { fakeBin } from './fake-bin.mjs';
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function httpGet(url) {
@@ -62,7 +64,7 @@ function startAdminBridge(envExtra = {}) {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,
-        CURSOR_BIN: path.join(ROOT, 'test', 'fake-agent.sh'),
+        CURSOR_BIN: fakeBin('cursor'),
         CURSOR_BRIDGE_WORKSPACE_ROOTS: repo,
         CURSOR_BRIDGE_STATE_DIR: stateDir,
         CURSOR_BRIDGE_LOG_LEVEL: 'info',

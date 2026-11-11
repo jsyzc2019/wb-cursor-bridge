@@ -24,9 +24,11 @@ import { execFileSync } from 'node:child_process';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DIST = path.join(ROOT, 'dist', 'index.js');
-// 跨平台选择 fake-agent：Windows 用 .cmd shim，便于将来接入 Windows CI 真跑。
+// 跨平台选择 fake-agent：POSIX 用 .sh（shebang + exec 位），Windows 用 .mjs
+// 由桥经当前 Node 执行——Windows 既不能直接执行 .mjs，也不允许无 shell spawn
+// .cmd/.bat（CVE-2024-27980）。
 const FAKE = process.platform === 'win32'
-  ? path.join(ROOT, 'test', 'fake-agent.cmd')
+  ? path.join(ROOT, 'test', 'fake-agent.mjs')
   : path.join(ROOT, 'test', 'fake-agent.sh');
 
 // ---- 确保 dist 已构建 -----------------------------------------------------
@@ -110,10 +112,6 @@ async function readSse(res, timeoutMs = 15000) {
     if (events.some((e) => e?.final)) break;
   }
   return events;
-}
-
-function timeout(ms) {
-  return new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms));
 }
 
 function freePort() {
