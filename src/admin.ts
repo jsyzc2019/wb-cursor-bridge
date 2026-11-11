@@ -7,8 +7,17 @@
  * only and exposes read-only endpoints plus a shutdown trigger.
  */
 import http from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import type { JobManager } from './runner.js';
 import type { Logger } from './logger.js';
+
+/** Constant-time string comparison for the shutdown token. */
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
 
 export function startAdminServer(
   mgr: JobManager,
@@ -60,7 +69,7 @@ export function startAdminServer(
             (req.headers['x-shutdown-token'] as string | undefined) ??
             new URL(req.url ?? '', `http://127.0.0.1:${port}`).searchParams.get('token') ??
             '';
-          if (provided !== shutdownToken) {
+          if (!safeEqual(provided, shutdownToken)) {
             return send(401, { error: 'unauthorized: missing or invalid shutdown token' });
           }
         }

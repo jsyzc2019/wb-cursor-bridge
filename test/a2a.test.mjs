@@ -683,6 +683,60 @@ test('a2a(P2#12): blocking message/send returns a settled task', async () => {
   }
 });
 
+test('a2a(P1): a blocking caller that disconnects must not cancel the task', async () => {
+  const repo = makeRepo();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbstate-a2a-drop-'));
+  const log = new Logger({ level: 'error', fileDir: stateDir });
+  const { mgr, server, base } = await startServer(makeConfig(repo, stateDir), log);
+  try {
+    const ac = new AbortController();
+    const pending = fetch(`${base}/a2a`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'message/send',
+        params: {
+          message: userMessage('MIDRUN take your time'),
+          configuration: { blocking: true },
+        },
+      }),
+      signal: ac.signal,
+    })
+      .then((r) => r.json())
+      .catch((err) => ({ aborted: true, name: err.name }));
+
+    // Let the request reach the blocking wait, then hang up like a closed tab.
+    await new Promise((r) => setTimeout(r, 300));
+    ac.abort();
+    const outcome = await pending;
+    assert.equal(outcome.aborted, true, 'the client-side call must have been aborted');
+
+    // A disconnect is not a cancel: the task must keep running.
+    const [job] = mgr.store.list({ limit: 1 });
+    assert.ok(job, 'the task must exist');
+    assert.equal(job.status, 'running', 'a disconnect must not cancel the work');
+
+    // The server must still serve, and must not mistake a dead socket for a
+    // reason to cancel the work. (Measured: Node silently swallows a write to a
+    // destroyed response, so this is a contract guard, not a crash repro.)
+    const card = await fetch(`${base}/.well-known/agent.json`);
+    assert.equal(card.status, 200);
+
+    // ...and the task finishes on its own.
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline && mgr.store.get(job.id).status === 'running') {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(mgr.store.get(job.id).status, 'completed');
+  } finally {
+    server.close();
+    await rmSafe(stateDir);
+    await rmSafe(repo);
+  }
+});
+
 test('a2a(P2#12): acceptedOutputModes with no overlap is rejected', async () => {
   const repo = makeRepo();
   const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbstate-a2a-neg-'));

@@ -17,6 +17,7 @@ import {
   changedFiles,
   diffStat,
   removeWorktree,
+  applyPatch,
   type Worktree,
 } from './util/git.js';
 import { concurrency, badArgument } from './errors.js';
@@ -248,6 +249,49 @@ export class JobManager {
       job.isolation = 'none';
     }
 
+    // --- resume continuity ---------------------------------------------------
+    // A paused task's worktree was removed when the previous pass ended, so this
+    // pass starts from a clean HEAD. Re-apply the patch captured before the
+    // pause; otherwise the files the worker already wrote vanish and the resumed
+    // thread talks about a tree that no longer exists.
+    //
+    // Fail closed: if the saved work cannot be restored (the base moved, the
+    // patch was pruned), drop back to `input-required` with an explicit event
+    // instead of running the worker on a tree missing its own earlier output.
+    if (worktree && job.patchFile) {
+      const restored = await applyPatch(worktree.path, job.patchFile);
+      if (!restored.ok) {
+        this.log.error('failed to restore paused worktree changes', {
+          jobId: job.id,
+          patchFile: job.patchFile,
+          reason: restored.reason,
+        });
+        job.status = 'input-required';
+        job.inputRequiredAt = job.inputRequiredAt ?? new Date().toISOString();
+        this.inflight.delete(job.id);
+        this.store.appendEvent(job, {
+          ts: new Date().toISOString(),
+          type: 'note',
+          text:
+            'resume blocked: the changes saved before the pause could not be restored ' +
+            `(${restored.reason}); the task is still input-required and the saved patch is intact`,
+        });
+        this.store.touch();
+        await this.store.flushNow();
+        return;
+      }
+      this.store.appendEvent(job, {
+        ts: new Date().toISOString(),
+        type: 'note',
+        text: `restored ${job.changedFiles?.length ?? 0} changed file(s) saved before the pause`,
+      });
+    }
+
+    // From here on the task is genuinely executing: the open question no longer
+    // describes its state. Cleared late so a failed restore can keep it.
+    job.pendingInput = undefined;
+    job.inputRequiredAt = undefined;
+
     const runWorkspace = worktree ? worktree.path : job.workspace;
 
     // The whole run — including the worktree-dependent artefact capture — lives
@@ -365,6 +409,9 @@ export class JobManager {
     job.inputRequiredAt = new Date().toISOString();
     if (outcome.result) job.result = outcome.result;
     if (outcome.threadId) job.threadId = outcome.threadId;
+    // A paused task must not silently drop the truncation flag: a caller that
+    // sees a short result has to know it was capped rather than complete.
+    job.truncated = job.truncated || outcome.truncated || false;
     job.durationMs = outcome.durationMs;
     this.inflight.delete(job.id);
     this.store.appendEvent(job, {
@@ -392,9 +439,19 @@ export class JobManager {
         `task ${job.id} is in state '${job.status}', not 'input-required'; cannot resume`,
       );
     }
+    // The tier is fixed when the task is created. Silently accepting a different
+    // tier here would let a caller believe it downgraded (or upgraded) a task
+    // that keeps running under its original permissions.
+    if (tier && tier !== job.tier) {
+      throw badArgument(
+        `task ${job.id} was created with tier '${job.tier}'; an input-required resume cannot ` +
+          `change it to '${tier}' - start a new task instead`,
+      );
+    }
     job.status = 'running';
-    job.pendingInput = undefined;
-    job.inputRequiredAt = undefined;
+    // Keep `pendingInput` until execute() actually gets past the worktree
+    // restore: if that restore fails the task drops back to input-required and
+    // the caller must still see the original question.
     this.store.appendEvent(job, {
       ts: new Date().toISOString(),
       type: 'input',

@@ -72,6 +72,13 @@ interface PersistedIndex {
       | 'durationMs'
       | 'truncated'
       | 'pendingInput'
+      | 'inputRequiredAt'
+      | 'model'
+      | 'isolation'
+      | 'changedFiles'
+      | 'diffStat'
+      | 'patchFile'
+      | 'reportFile'
     >
   >;
 }
@@ -261,6 +268,17 @@ export class JobStore {
         durationMs: j.durationMs,
         truncated: j.truncated,
         pendingInput: j.pendingInput,
+        // Artefact pointers must survive a restart: an input-required task can
+        // sit for days, and resuming it after a bridge restart must still find
+        // the patch of the pass that paused. Paths are derived from stateDir at
+        // capture time, so they stay valid for the same deployment.
+        inputRequiredAt: j.inputRequiredAt,
+        model: j.model,
+        isolation: j.isolation,
+        changedFiles: j.changedFiles,
+        diffStat: j.diffStat,
+        patchFile: j.patchFile,
+        reportFile: j.reportFile,
       })),
     };
     try {

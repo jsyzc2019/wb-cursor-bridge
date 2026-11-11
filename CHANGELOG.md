@@ -4,6 +4,57 @@
 `src/version.ts` 是版本号的唯一来源，测试会断言其与 `package.json` 一致——
 版本不一致无法通过测试，因此不可能发出版本号错乱的包。
 
+## 0.4.1 — 中断续跑不再丢工作 + 失败路径硬化
+
+全仓测试 **97 → 105** 项（49 单元 + 5 硬化 + 18 端到端 + 3 admin + 30 A2A），
+`verify:e2e` 54 项全过。所有条目都有先红后绿的回归用例，修复前的失败原因已实测记录。
+
+### 修复：`input-required` 暂停期丢失已完成的改动（P0，数据丢失）
+
+`execute` 档任务在 `input-required` 暂停时，托管 worktree 随该轮结束被删除，而续跑轮
+从干净的 `HEAD` 重建——**第一轮已经写好的文件全部消失**，续跑线程却以为自己还在原来的
+树上继续工作。实测：续跑轮的 worker 看不到自己上一轮创建的 `first-pass.txt`。
+
+- **`runner.ts`**：续跑前把暂停时保存的 patch 回放到新 worktree（`applyPatch`）。
+  最终 patch 仍是相对 `HEAD` 的累计 diff，跨多轮中断也成立。
+- **`util/git.ts` 新增 `applyPatch()`**：`git apply --index` → 失败时 `--3way`
+  （调用方在暂停期间提交过、基线移动的常见情形）。
+- **失败即关闭（fail closed）**：无法回放时任务退回 `input-required`，保留原问题、
+  保留 patch 文件并追加 `resume blocked: …` 事件，**绝不在残缺的树上继续跑 worker**
+  而假装成功。
+- **`captureDiff` 加 `--binary`**：此前二进制改动只会得到 `Binary files differ`，
+  无法回放，图片/资源类改动会让续跑必然失败。
+- **`store.ts`**：持久化 `patchFile` / `reportFile` / `changedFiles` / `diffStat` /
+  `isolation` / `model` / `inputRequiredAt`。此前只存内存，**桥重启后暂停任务的 patch
+  指针丢失，同样无法还原**；`input-required` 可跨天存在，重启是常态而非例外。
+
+### 修复：续跑不得静默改变权限档位
+
+`cursor_reply` 暴露 `tier` 参数，但 `input-required` 原地续跑时被静默忽略——调用方会
+误以为任务降级/升级了，实际仍按原档位运行。现在显式拒绝并说明原因，需换档请新建任务。
+
+### 修复：异常 worker 可把内存吃光（无上限缓冲）
+
+- **`util/ndjson.ts`**：`NdjsonReader` 现在有单行硬上限（默认 8 MiB）。一个永不换行（或吐出超大单行）的 worker 过去会让 `buffer` 无限增长直到进程 OOM；现在超限行被丢弃、计数并跳过至下一个换行，后续正常事件照常解析，并给出 `dropped N oversized stream line(s)` 事件而不是假装无输出。
+- **`cursor/cli.ts`**：`result` 边流边截断，`maxResultBytes` 不再只在进程退出时生效；同时保留 16 KiB 尾部窗口，**结果被截断后仍能识别最后一行 `NEED_INPUT:`**（否则话多的 worker 会"静默完成"而不是暂停提问）。
+- **`runner.ts`**：`pauseForInput` 补写 `truncated`，暂停态不再丢失"结果被截断"的事实。
+
+### 改进：blocking 调用不再为已断开的客户端空转
+
+`awaitBlockingFinal` 接 `AbortSignal`（由 `res` 的 `close` 触发）：客户端挂断后立即结束等待，**但绝不取消任务**——工作仍然被需要，调用方可以重连轮询/重订阅。
+`sendJson` 增加已销毁响应的写入保护。
+
+> 说明：实测 Node 会静默吞掉对已销毁响应的写入，因此这**不是**一个防崩修复（曾有此假设，已被用例证伪）；真实收益是每个被放弃的 blocking 请求不再空转至 `a2aBlockingMaxMs`，以及不再依赖运行时行为兜底。
+
+### 测试
+
+- `e2e(P0-B)` ×3：暂停后文件不丢（含二进制）、**桥重启后仍能续跑并还原**、
+  patch 不可回放时 fail closed 且问题与 patch 都还在。
+- `e2e(P1)`：20 万字符洪泛下结果被截断在预算内，且**截断后仍正确进入 input-required**。
+- `unit` ×3：永不换行的行被限界/计数/可恢复、超长完整行被丢弃、`end()` 不泄漏残片。
+- `a2a(P1)`：blocking 客户端断连不取消任务、服务仍可用、任务自行完成。
+- `test/fake-agent.mjs` 新增 `needinput-write` 与 `flood-needinput` 模式，把"是否丢工作""是否被截断"变成可断言的事实。
+
 ## 0.4.0 — 生产级审计收尾：v1.0 迁移路线 + 协议协商 + 限流/CORS + 资源生命周期硬化
 
 闭合 AUDIT-PROD-GRADE-A+.md 中剩余的 **Phase 2 末段（#12/#14 通知、#15 CORS/限流）+ Phase 3（#16–#20）** 全部条目。

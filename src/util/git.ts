@@ -77,13 +77,56 @@ export async function captureDiff(
   try {
     // Stage everything first so newly created files appear in the patch.
     await git(worktreePath, ['add', '-A'], 30_000);
-    const patch = await git(worktreePath, ['diff', '--cached', 'HEAD'], 30_000);
+    // `--binary` embeds binary blobs as base64. Without it git emits
+    // "Binary files differ", which cannot be re-applied when a paused task is
+    // resumed - images and other assets would silently block the restore.
+    const patch = await git(worktreePath, ['diff', '--cached', '--binary', 'HEAD'], 30_000);
     if (!patch.trim()) return null;
     fs.mkdirSync(path.dirname(outFile), { recursive: true });
     fs.writeFileSync(outFile, patch, 'utf8');
     return { file: outFile, bytes: Buffer.byteLength(patch, 'utf8') };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Re-apply a patch captured during an earlier pass into a fresh worktree.
+ *
+ * A paused (`input-required`) task holds no live worktree: the worktree is torn
+ * down when the pass ends and the next pass starts from a clean checkout of
+ * HEAD. Without this step every file the worker wrote before asking its
+ * question would silently disappear, and the resumed thread would reason about
+ * code that no longer exists.
+ *
+ * Returns a structured failure instead of throwing so the caller can decide to
+ * fail closed rather than run the worker on a half-restored tree.
+ */
+export async function applyPatch(
+  worktreePath: string,
+  patchFile: string,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!fs.existsSync(patchFile)) {
+    return { ok: false, reason: `saved patch is missing: ${patchFile}` };
+  }
+  try {
+    await git(worktreePath, ['apply', '--index', '--whitespace=nowarn', patchFile], 60_000);
+    return { ok: true };
+  } catch (direct) {
+    // The base may have moved while the task was paused (the caller committed).
+    // A three-way merge recovers the common case; the blob objects are still in
+    // the shared object store because `captureDiff` staged them before diffing.
+    try {
+      await git(
+        worktreePath,
+        ['apply', '--index', '--3way', '--whitespace=nowarn', patchFile],
+        60_000,
+      );
+      return { ok: true };
+    } catch {
+      const raw = direct instanceof Error ? direct.message : String(direct);
+      return { ok: false, reason: raw.split('\n').filter(Boolean).slice(0, 3).join(' ').trim() };
+    }
   }
 }
 

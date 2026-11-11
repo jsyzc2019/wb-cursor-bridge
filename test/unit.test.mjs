@@ -127,6 +127,37 @@ test('NdjsonReader: handles CRLF and blank lines', () => {
   assert.deepEqual(r.push(Buffer.from('{"a":1}\r\n\n{"b":2}\r\n')), ['{"a":1}', '{"b":2}']);
 });
 
+test('NdjsonReader: a line that never ends is bounded, counted, and recoverable', () => {
+  const r = new NdjsonReader(64);
+  // 1 KiB without a newline: cannot be a valid event, must not accumulate.
+  assert.deepEqual(r.push(Buffer.from('x'.repeat(1024))), []);
+  assert.equal(r.pending, 0, 'the oversized partial line must be dropped');
+  assert.equal(r.droppedLines, 1);
+  assert.ok(r.droppedBytes >= 1024);
+
+  // Still inside the oversized line: bytes are skipped, not buffered.
+  assert.deepEqual(r.push(Buffer.from('y'.repeat(512))), []);
+  assert.equal(r.pending, 0);
+
+  // The line finally ends; the NEXT line must parse normally.
+  assert.deepEqual(r.push(Buffer.from('tail\n{"ok":true}\n')), ['{"ok":true}']);
+  assert.equal(r.droppedLines, 1, 'one logical line is counted once');
+});
+
+test('NdjsonReader: a complete but oversized line is dropped, following lines survive', () => {
+  const r = new NdjsonReader(32);
+  const out = r.push(Buffer.from(`${'z'.repeat(100)}\n{"ok":1}\n`));
+  assert.deepEqual(out, ['{"ok":1}']);
+  assert.equal(r.droppedLines, 1);
+});
+
+test('NdjsonReader: end() never leaks the remnant of a dropped line', () => {
+  const r = new NdjsonReader(16);
+  r.push(Buffer.from('w'.repeat(64)));
+  assert.deepEqual(r.end(), [], 'the remnant must not be parsed as a line');
+  assert.equal(r.pending, 0);
+});
+
 test('NdjsonReader: survives a multi-byte character split mid-sequence', () => {
   const r = new NdjsonReader();
   const text = Buffer.from('{"t":"完成"}\n', 'utf8');

@@ -13,7 +13,8 @@
  */
 import http from 'node:http';
 import fs from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
 import type { JobManager } from '../runner.js';
 import type { Config } from '../config.js';
 import type { Logger } from '../logger.js';
@@ -145,6 +146,12 @@ export function startA2AServer(
   const rateLimit = new TokenBucket(ratePerSec, ratePerSec);
 
   const server = http.createServer((req, res) => {
+    // Defence in depth: a synchronous throw anywhere below (e.g. a malformed
+    // URI reaching decodeURIComponent) must never escape this listener - an
+    // uncaught throw becomes an uncaughtException and shuts the whole bridge
+    // down, turning one bad request into a remote DoS. Catch, log, and answer
+    // 500 instead.
+    try {
     const url = (req.url ?? '/').split('?')[0];
 
     // When CORS origins are configured (opt-in), reflect the requesting origin
@@ -236,6 +243,16 @@ export function startA2AServer(
       agentCard: '/.well-known/agent.json',
       rpc: 'POST /a2a',
     });
+    } catch (err) {
+      log.error('a2a request handler error', {
+        err: err instanceof Error ? err.stack : String(err),
+      });
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: 'internal error' });
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    }
   });
 
   server.on('error', (err) => {
@@ -287,13 +304,21 @@ function applyCors(req: http.IncomingMessage, res: http.ServerResponse, config: 
 }
 
 function sendJson(res: http.ServerResponse, code: number, body: unknown): void {
+  // A blocking caller may have disconnected while we held its request open.
+  // Writing to a destroyed response is at best wasted work; guard so the bridge
+  // never depends on the runtime quietly swallowing it.
+  if (res.writableEnded || res.destroyed) return;
   const payload = JSON.stringify(body);
-  res.writeHead(code, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(payload),
-    'cache-control': 'no-store',
-  });
-  res.end(payload);
+  try {
+    res.writeHead(code, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': Buffer.byteLength(payload),
+      'cache-control': 'no-store',
+    });
+    res.end(payload);
+  } catch {
+    /* client vanished between the check and the write */
+  }
 }
 
 function sendJsonRpc(res: http.ServerResponse, id: string | number | null, body: Partial<JsonRpcResponse>): void {
@@ -326,12 +351,26 @@ async function readBody(req: http.IncomingMessage): Promise<Buffer> {
   });
 }
 
+/** Constant-time string comparison for secrets (guards against timing oracles). */
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
 function authOk(req: http.IncomingMessage, token?: string): boolean {
   if (!token) return true;
   const header = req.headers['authorization'];
   const direct = req.headers['x-a2a-token'];
   const bearer = typeof header === 'string' ? header.replace(/^Bearer\s+/i, '') : undefined;
-  return bearer === token || direct === token;
+  const directStr = typeof direct === 'string' ? direct : undefined;
+  // Compare in constant time so a caller cannot recover the token byte-by-byte
+  // from response timing on a long-lived, network-reachable endpoint.
+  return (
+    (bearer !== undefined && safeEqual(bearer, token)) ||
+    (directStr !== undefined && safeEqual(directStr, token))
+  );
 }
 
 async function handlePost(
@@ -391,13 +430,31 @@ async function handlePost(
     return;
   }
 
+  // A blocking `message/send` can hold this connection for up to
+  // `a2aBlockingMaxMs`. If the client hangs up we stop waiting (freeing the
+  // request) but never cancel the task itself: the work is still wanted and a
+  // caller may reconnect and poll / resubscribe.
+  const disconnect = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) disconnect.abort();
+  };
+  res.once('close', onClose);
+
   try {
-    const result = await dispatch(mgr, skills, config, log, parsed, artifactBase);
+    const result = await dispatch(mgr, skills, config, log, parsed, artifactBase, disconnect.signal);
+    if (disconnect.signal.aborted) {
+      log.info('a2a client disconnected during a blocking call; task keeps running', {
+        method: parsed.method,
+      });
+      return;
+    }
     sendJsonRpc(res, id, { result });
   } catch (err) {
     const code = a2aErrorCode(err);
     log.warn('a2a rpc error', { method: parsed.method, code, message: String((err as Error)?.message) });
     sendJsonRpc(res, id, rpcError(code, (err as Error)?.message ?? 'internal error'));
+  } finally {
+    res.off('close', onClose);
   }
 }
 
@@ -423,6 +480,7 @@ async function dispatch(
   log: Logger,
   req: JsonRpcRequest,
   artifactBase: () => string,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const params = (req.params ?? {}) as Record<string, unknown>;
   const a2aVersion = config.a2aProtocolVersion ?? '0.3.0';
@@ -452,7 +510,12 @@ async function dispatch(
       // task without a second round-trip. The cap prevents a long-running job
       // from pinning the HTTP connection indefinitely.
       if (configuration?.blocking) {
-        const final = await awaitBlockingFinal(mgr, job.id, config.a2aBlockingMaxMs ?? 90_000);
+        const final = await awaitBlockingFinal(
+          mgr,
+          job.id,
+          config.a2aBlockingMaxMs ?? 90_000,
+          signal,
+        );
         return toTask(final, taskOpts);
       }
       return toTask(job, taskOpts);
@@ -599,19 +662,40 @@ async function awaitBlockingFinal(
   mgr: JobManager,
   taskId: string,
   maxMs: number,
+  signal?: AbortSignal,
 ): Promise<Job> {
   const deadline = Date.now() + maxMs;
   for (;;) {
     const job = mgr.store.get(taskId);
     if (!job) throw notFound(`unknown task ${taskId}`);
     if (isFinalState(toTaskState(job.status))) return job;
+    // The caller is gone: hand back the current task and stop holding a
+    // request slot. The job continues in the background.
+    if (signal?.aborted) return job;
     if (Date.now() >= deadline) {
       // Cap reached: hand back the current (likely still working) task rather
       // than erroring, so the client can switch to polling / streaming.
       return job;
     }
-    await new Promise((r) => setTimeout(r, 300));
+    await sleepOrAbort(300, signal);
   }
+}
+
+/** setTimeout that resolves immediately when the signal aborts. */
+function sleepOrAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener('abort', finish, { once: true });
+  });
 }
 
 /* --------------------------------------------------------------- streaming */
@@ -689,8 +773,18 @@ function serveArtifact(
     sendJson(res, 401, rpcError(A2A_ERROR.AUTH_REQUIRED, 'unauthorized: missing or invalid A2A token'));
     return;
   }
-  const taskId = decodeURIComponent(taskIdRaw);
-  const name = decodeURIComponent(nameRaw);
+  // Decode defensively: a malformed percent-escape (e.g. /a2a/artifacts/%zz/x)
+  // makes decodeURIComponent throw a URIError. Letting it escape would crash the
+  // listener; answer 400 instead.
+  let taskId: string;
+  let name: string;
+  try {
+    taskId = decodeURIComponent(taskIdRaw);
+    name = decodeURIComponent(nameRaw);
+  } catch {
+    sendJson(res, 400, { error: 'malformed artifact path' });
+    return;
+  }
   const job = mgr.store.get(taskId);
   if (!job) {
     sendJson(res, 404, { error: 'unknown task' });
@@ -731,7 +825,7 @@ function serveArtifact(
  * bridge into a Server-Side Request Forgery: only public http(s) endpoints are
  * allowed, and private / loopback / link-local hosts are blocked.
  */
-function unsafePushUrl(url: string, allowlist?: string[]): string | null {
+export function unsafePushUrl(url: string, allowlist?: string[]): string | null {
   let u: URL;
   try {
     u = new URL(url);
@@ -741,26 +835,47 @@ function unsafePushUrl(url: string, allowlist?: string[]): string | null {
   if (u.protocol !== 'http:' && u.protocol !== 'https:') {
     return `unsupported scheme "${u.protocol}" (only http/https allowed)`;
   }
-  const host = u.hostname;
-  if (allowlist && (allowlist.includes(host) || allowlist.includes(u.host))) {
+  // WHATWG URL keeps IPv6 literals bracketed in `hostname` ("[::1]"), so strip
+  // the brackets before classifying. Treat only genuine IP literals with the IP
+  // rules below; domain names must NOT be matched by IPv6 prefix heuristics (an
+  // earlier version rejected legitimate hosts like fc2.com / fdic.gov).
+  const rawHost = u.hostname;
+  const host = rawHost.startsWith('[') && rawHost.endsWith(']')
+    ? rawHost.slice(1, -1)
+    : rawHost;
+
+  if (allowlist && (allowlist.includes(rawHost) || allowlist.includes(host) || allowlist.includes(u.host))) {
     return null; // explicitly trusted target
   }
+
+  const ipVersion = isIP(host);
+  if (ipVersion === 6) {
+    const lower = host.toLowerCase();
+    if (lower === '::1' || lower === '::') return 'IPv6 loopback/unspecified is not an allowed push target';
+    if (/^f[cd]/.test(lower)) return 'IPv6 unique-local (fc00::/7) is not an allowed push target';
+    if (/^fe[89ab]/.test(lower)) return 'IPv6 link-local (fe80::/10) is not an allowed push target';
+    return null; // other global IPv6 literals are permitted
+  }
+
   if (host === 'localhost' || host.endsWith('.localhost') || host === '0.0.0.0') {
     return 'localhost is not an allowed push target';
   }
-  if (host === '::1' || host.startsWith('fc') || host.startsWith('fd') || /^fe[89ab]/i.test(host)) {
-    return 'IPv6 loopback / unique-local / link-local is not an allowed push target';
-  }
-  const octets = host.split('.');
-  if (octets.length === 4 && octets.every((o) => /^\d{1,3}$/.test(o))) {
-    const a = Number(octets[0]);
-    const b = Number(octets[1]);
+
+  if (ipVersion === 4) {
+    const octets = host.split('.').map(Number);
+    const [a, b] = octets;
     if (a === 10) return 'RFC1918 private (10/8) is not an allowed push target';
     if (a === 127) return 'loopback (127/8) is not an allowed push target';
+    if (a === 0) return 'unspecified (0/8) is not an allowed push target';
     if (a === 169 && b === 254) return 'link-local (169.254/16) is not an allowed push target';
     if (a === 172 && b >= 16 && b <= 31) return 'RFC1918 private (172.16/12) is not an allowed push target';
     if (a === 192 && b === 168) return 'RFC1918 private (192.168/16) is not an allowed push target';
+    if (a === 100 && b >= 64 && b <= 127) return 'carrier-grade NAT (100.64/10) is not an allowed push target';
   }
+  // Remaining risk (documented, not silently ignored): a public hostname that
+  // resolves to a private IP via DNS rebinding still passes this string-level
+  // check. Closing that fully requires resolving DNS and re-checking the IP at
+  // connect time; operators who need it should set a2aPushUrlAllowlist.
   return null;
 }
 

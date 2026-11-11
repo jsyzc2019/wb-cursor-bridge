@@ -162,9 +162,54 @@ export async function runCursor(
 
   let pid: number | undefined = proc.pid;
   let result = '';
+  let resultChars = 0;
   let truncated = false;
   let threadId: string | undefined;
   let settled = false;
+
+  /**
+   * Hard cap applied while streaming, not just at the end.
+   *
+   * `capText()` used to run only when the process exited, so a worker that kept
+   * emitting assistant text grew `result` for minutes - an OOM vector on a
+   * long-running task. We now stop appending once the budget is spent.
+   * Chars are a safe over-approximation of UTF-8 bytes for this purpose; the
+   * exact byte cut still happens in `capText()` at the end.
+   */
+  const maxResultChars = Math.max(1024, cfg.maxResultBytes);
+  /**
+   * Bounded tail of everything the worker emitted. The `NEED_INPUT:` marker
+   * must be the last line, so once the answer is capped it may no longer be in
+   * `result`; keeping a small tail window lets the pause signal still be
+   * detected without reopening the unbounded-memory hole.
+   */
+  const TAIL_CHARS = 16 * 1024;
+  let markerTail = '';
+
+  const appendText = (text: string): void => {
+    if (!text) return;
+    markerTail = (markerTail + text).slice(-TAIL_CHARS);
+    if (resultChars >= maxResultChars) {
+      truncated = true;
+      return;
+    }
+    const room = maxResultChars - resultChars;
+    if (text.length <= room) {
+      result += text;
+      resultChars += text.length;
+    } else {
+      result += text.slice(0, room);
+      resultChars = maxResultChars;
+      truncated = true;
+    }
+  };
+
+  /** A `result` event carries the whole answer: it replaces, not appends. */
+  const setResult = (text: string): void => {
+    result = '';
+    resultChars = 0;
+    appendText(text);
+  };
 
   const logKillResult = async (killPid: number): Promise<void> => {
     const outcome = await killTreeGracefully(killPid);
@@ -178,6 +223,7 @@ export async function runCursor(
   };
 
   const reader = new NdjsonReader();
+  let droppedSeen = 0;
 
   proc.stdout.on('data', (chunk: Buffer) => {
     for (const line of reader.push(chunk)) {
@@ -190,7 +236,7 @@ export async function runCursor(
       switch (ev.kind) {
         case 'text':
           if (ev.text) {
-            result += ev.text;
+            appendText(ev.text);
             cb.onEvent({ type: 'assistant', text: ev.text });
           }
           break;
@@ -198,7 +244,7 @@ export async function runCursor(
           cb.onEvent({ type: 'tool', detail: describeTool(ev) });
           break;
         case 'result':
-          if (ev.text) result = ev.text;
+          if (ev.text) setResult(ev.text);
           break;
         case 'error':
           cb.onEvent({ type: 'stderr', text: ev.text ?? 'unknown error' });
@@ -206,6 +252,16 @@ export async function runCursor(
         default:
           break;
       }
+    }
+    // An oversized line cannot be a valid event; say so instead of silently
+    // pretending the worker produced nothing.
+    if (reader.droppedLines > droppedSeen) {
+      const delta = reader.droppedLines - droppedSeen;
+      droppedSeen = reader.droppedLines;
+      cb.onEvent({
+        type: 'note',
+        text: `dropped ${delta} oversized stream line(s) totalling ${reader.droppedBytes} chars`,
+      });
     }
   });
 
@@ -237,7 +293,7 @@ export async function runCursor(
     // Flush any trailing partial line and capture a final result event.
     for (const line of reader.end()) {
       const ev = parseStreamLine(line);
-      if (ev?.kind === 'result' && ev.text) result = ev.text;
+      if (ev?.kind === 'result' && ev.text) setResult(ev.text);
     }
 
     let exit = exitCode;
@@ -252,14 +308,21 @@ export async function runCursor(
     // Detect an A2A input-required signal before capping, so the question is
     // never truncated out of the result.
     const extracted = extractNeedInput(result);
+    let needInput = extracted.needInput;
+    if (!needInput && truncated) {
+      // The answer was capped mid-stream, so the marker's final line may not be
+      // in `result` any more; the preserved tail still has it.
+      const fromTail = extractNeedInput(markerTail);
+      if (fromTail.needInput) needInput = fromTail.needInput;
+    }
     const capped = capText(extracted.result, cfg.maxResultBytes);
     return {
       exitCode: exit,
       result: capped.text,
-      truncated: capped.truncated,
+      truncated: capped.truncated || truncated,
       threadId,
       durationMs: Date.now() - started,
-      needInput: extracted.needInput,
+      needInput,
     };
   };
 

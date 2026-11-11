@@ -36,13 +36,70 @@ if (mode === 'write') {
   out({ type: 'tool_call', tool_call: { writeToolCall: { args: { path: 'changed-by-fake.txt' } } } });
 }
 
+/**
+ * WB_FAKE_MODE=needinput-write: write a file, THEN ask the question.
+ *
+ * The resumed pass reports whether that file survived the pause. This is the
+ * regression probe for work lost across an input-required round-trip: the
+ * bridge must hand the second pass the tree the first pass produced.
+ */
+let restoredAcrossPause;
+if (mode === 'needinput-write') {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const first = path.join(process.cwd(), 'first-pass.txt');
+  const bin = path.join(process.cwd(), 'first-pass.bin');
+  // A byte with a NUL makes git treat the file as binary; restoring it requires
+  // a `--binary` patch.
+  const binBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0xff]);
+  if (isResume) {
+    restoredAcrossPause =
+      fs.existsSync(first) &&
+      fs.existsSync(bin) &&
+      Buffer.compare(fs.readFileSync(bin), binBytes) === 0;
+    fs.writeFileSync(path.join(process.cwd(), 'second-pass.txt'), 'from pass two\n');
+    out({ type: 'tool_call', tool_call: { readToolCall: { args: { path: 'first-pass.txt' } } } });
+  } else {
+    fs.writeFileSync(first, 'from pass one\n');
+    fs.writeFileSync(bin, binBytes);
+    out({ type: 'tool_call', tool_call: { writeToolCall: { args: { path: 'first-pass.txt' } } } });
+  }
+}
+
+/**
+ * WB_FAKE_MODE=flood-needinput: emit a large volume of assistant text and then
+ * the pause marker, with no `result` event.
+ *
+ * The bridge must stop buffering once `maxResultBytes` is reached (a worker that
+ * talks for minutes must not grow memory without bound) while still noticing the
+ * `NEED_INPUT:` line that arrived after the cap.
+ */
+if (mode === 'flood-needinput') {
+  const chunk = 'x'.repeat(1024);
+  for (let i = 0; i < 200; i += 1) {
+    out({ type: 'assistant', message: { content: [{ type: 'text', text: chunk }] } });
+  }
+  out({
+    type: 'assistant',
+    message: { content: [{ type: 'text', text: '\nNEED_INPUT: which file should I edit?' }] },
+  });
+  // Let the pipe drain: process.exit() would drop the tail of ~200 KiB of writes
+  // and the marker would never reach the bridge (a fixture bug, not a bridge one).
+  await sleep(200);
+  process.exit(0);
+}
+
 await sleep(120);
 out({ type: 'assistant', message: { content: [{ type: 'text', text: 'analysed ' + process.cwd() }] } });
 out({ type: 'tool_call', tool_call: { readToolCall: { args: { path: 'src/index.ts' } } } });
 await sleep(80);
 
 let resultText;
-if (mode === 'needinput' && !isResume) {
+if (mode === 'needinput-write' && !isResume) {
+  resultText = 'I started the work but need a decision.\nNEED_INPUT: which file should I edit?';
+} else if (mode === 'needinput-write') {
+  resultText = `FAKE_RESULT:resumed RESTORED:${restoredAcrossPause ? 'yes' : 'no'}`;
+} else if (mode === 'needinput' && !isResume) {
   // A2A input-required signal: the answer plus an open question at the tail.
   resultText =
     'I analysed the repo but need more information.\nNEED_INPUT: which file should I edit?';

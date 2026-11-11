@@ -43,6 +43,14 @@ if (longRun) {
   process.exit(0);
 }
 
+// A short-but-not-instant run, so a client can disconnect mid-flight while the
+// task legitimately keeps working.
+if (joined.includes('MIDRUN')) {
+  await sleep(1200);
+  out({ type: 'result', result: 'FAKE_RESULT:midrun', thread_id: threadId });
+  process.exit(0);
+}
+
 if (writeFile) {
   fs.writeFileSync(path.join(process.cwd(), 'written-by-fake.txt'), 'hello\n');
 }

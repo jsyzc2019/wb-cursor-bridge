@@ -299,6 +299,173 @@ test('e2e: input-required pauses the task and cursor_reply resumes the SAME job'
   }
 });
 
+test('e2e(P0-B): a paused execute task keeps the files it already wrote', async () => {
+  const repo = makeRepo();
+  const { client, stateDir } = startClient(repo, { WB_FAKE_MODE: 'needinput-write' });
+  try {
+    await client.init();
+    const started = await client.call('cursor_run', {
+      prompt: 'start the implementation', workspace: repo, tier: 'execute',
+    });
+    assert.equal(started.data.isolation, 'bridge-worktree');
+
+    const paused = await waitFor(client, started.data.jobId);
+    assert.equal(paused.status, 'input-required');
+    // The first pass's work is captured before the worktree is torn down.
+    assert.ok(paused.patchFile, 'the paused pass must keep a patch');
+    assert.ok(existsSync(paused.patchFile), 'patch must be on disk while paused');
+    assert.ok(
+      paused.changedFiles.includes('first-pass.txt'),
+      `expected first-pass.txt, got ${JSON.stringify(paused.changedFiles)}`,
+    );
+    assert.ok(
+      paused.changedFiles.includes('first-pass.bin'),
+      'binary assets must be captured too, not just text files',
+    );
+
+    // A resume cannot silently change the task's permission tier.
+    const escalated = await client.call('cursor_reply', {
+      jobId: paused.jobId, prompt: 'edit first-pass.txt', tier: 'consult',
+    });
+    assert.equal(escalated.isError, true, 'a tier change on resume must be rejected');
+    assert.match(String(escalated.data), /cannot change it to 'consult'/);
+
+    const resumed = await client.call('cursor_reply', {
+      jobId: paused.jobId, prompt: 'edit first-pass.txt',
+    });
+    assert.equal(resumed.isError, false);
+    assert.equal(resumed.data.tier, 'execute', 'a resume must keep the original tier');
+
+    const done = await waitFor(client, resumed.data.jobId);
+    assert.equal(done.status, 'completed');
+    // The resumed worker saw the files its first pass created.
+    assert.match(done.result, /RESTORED:yes/, 'the resumed pass must see the earlier files');
+    assert.ok(done.changedFiles.includes('first-pass.txt'), 'earlier work must not be lost');
+    assert.ok(done.changedFiles.includes('first-pass.bin'), 'binary work must not be lost');
+    assert.ok(done.changedFiles.includes('second-pass.txt'), 'new work must be captured too');
+
+    // The final patch is cumulative across both passes.
+    const patch = readFileSync(done.patchFile, 'utf8');
+    assert.match(patch, /first-pass\.txt/);
+    assert.match(patch, /GIT binary patch/, 'binary content must be embedded so it can be replayed');
+    assert.match(patch, /second-pass\.txt/);
+    // ...and the caller's own checkout was never touched.
+    assert.equal(existsSync(path.join(repo, 'first-pass.txt')), false);
+    assert.equal(existsSync(path.join(repo, 'second-pass.txt')), false);
+  } finally {
+    await client.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('e2e(P0-B): a paused task survives a bridge restart and still restores its work', async () => {
+  const repo = makeRepo();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbstate-'));
+  const first = startClient(repo, { WB_FAKE_MODE: 'needinput-write', CURSOR_BRIDGE_STATE_DIR: stateDir });
+  let jobId;
+  let threadId;
+  try {
+    await first.client.init();
+    const started = await first.client.call('cursor_run', {
+      prompt: 'start the implementation', workspace: repo, tier: 'execute',
+    });
+    jobId = started.data.jobId;
+    const paused = await waitFor(first.client, jobId);
+    assert.equal(paused.status, 'input-required');
+    threadId = paused.threadId;
+  } finally {
+    // Hard restart: no graceful shutdown, exactly like a crash or a redeploy.
+    await first.client.close();
+  }
+
+  const second = startClient(repo, { WB_FAKE_MODE: 'needinput-write', CURSOR_BRIDGE_STATE_DIR: stateDir });
+  try {
+    await second.client.init();
+    const reloaded = await second.client.call('cursor_status', { jobId });
+    assert.equal(reloaded.data.status, 'input-required', 'a paused task must not become orphaned');
+    assert.ok(reloaded.data.patchFile, 'the patch pointer must be persisted, not just in memory');
+    assert.equal(reloaded.data.threadId, threadId, 'thread id must survive the restart');
+
+    const resumed = await second.client.call('cursor_reply', {
+      jobId, prompt: 'edit first-pass.txt',
+    });
+    assert.equal(resumed.isError, false);
+    const done = await waitFor(second.client, jobId);
+    assert.equal(done.status, 'completed');
+    assert.match(done.result, /RESTORED:yes/, 'work captured before the restart must be restored');
+    assert.ok(done.changedFiles.includes('first-pass.txt'));
+    assert.ok(done.changedFiles.includes('second-pass.txt'));
+  } finally {
+    await second.client.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('e2e(P0-B): an unrestorable pause fails closed instead of losing work', async () => {
+  const repo = makeRepo();
+  const { client, stateDir } = startClient(repo, { WB_FAKE_MODE: 'needinput-write' });
+  try {
+    await client.init();
+    const started = await client.call('cursor_run', {
+      prompt: 'start the implementation', workspace: repo, tier: 'execute',
+    });
+    const paused = await waitFor(client, started.data.jobId);
+    assert.equal(paused.status, 'input-required');
+
+    // Corrupt the saved patch: the restore can no longer succeed.
+    writeFileSync(paused.patchFile, 'this is not a patch\n', 'utf8');
+
+    const resumed = await client.call('cursor_reply', {
+      jobId: paused.jobId, prompt: 'edit first-pass.txt',
+    });
+    assert.equal(resumed.isError, false);
+
+    const settled = await waitFor(client, paused.jobId);
+    assert.equal(settled.status, 'input-required', 'a blocked resume must fall back to paused');
+    assert.equal(settled.pendingInput, 'which file should I edit?', 'the question is preserved');
+    const events = settled.events.map((e) => e.text ?? '').join('\n');
+    assert.match(events, /resume blocked/, 'the caller must be told why resume failed');
+    // Fail closed: the worker must not have run on a half-restored tree.
+    assert.doesNotMatch(settled.result ?? '', /RESTORED:/);
+  } finally {
+    await client.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('e2e(P1): a flooding worker is capped in memory and still raises input-required', async () => {
+  const repo = makeRepo();
+  const { client, stateDir } = startClient(repo, {
+    WB_FAKE_MODE: 'flood-needinput',
+    CURSOR_BRIDGE_MAX_RESULT_BYTES: '4096',
+  });
+  try {
+    await client.init();
+    const started = await client.call('cursor_run', {
+      prompt: 'talk a lot then ask', workspace: repo, tier: 'consult',
+    });
+    const paused = await waitFor(client, started.data.jobId);
+
+    // The pause signal arrived on the last line, AFTER the cap was reached: it
+    // must still be honoured, otherwise a chatty worker silently "completes".
+    assert.equal(paused.status, 'input-required');
+    assert.equal(paused.pendingInput, 'which file should I edit?');
+    // ~200 KiB was emitted; only the budget may be retained.
+    assert.ok(
+      paused.result.length <= 4200,
+      `result must be capped near 4096 chars, got ${paused.result.length}`,
+    );
+    assert.equal(paused.truncated, true, 'truncation must be reported, not silent');
+  } finally {
+    await client.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test('e2e: health and stats report the deployment accurately', async () => {
   const repo = makeRepo();
   const { client, stateDir } = startClient(repo);

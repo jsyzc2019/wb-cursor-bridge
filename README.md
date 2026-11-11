@@ -122,6 +122,10 @@ pushNotifications / stateTransitionHistory）、按 workspace root 派生的 `sk
 
 > **A2A 文本在 `parts[].text`，不在顶层 `.text`；`taskId` 是 Message 的顶层字段**（不在 metadata）。
 > 续跑/跟进沿用父任务的 `contextId`；产物以标准 `Artifact[]` 暴露，input-required 中断态保留在同一任务 id 上。
+>
+> **中断不等于丢弃**：暂停时已产生的改动会落盘为 patch，续跑轮自动回放到新 worktree，
+> 桥重启后同样成立。若无法回放（基线移动等），任务退回 `input-required` 并写明原因，
+> 绝不在残缺的代码树上继续执行。
 
 ### 推送通知（可选）
 
@@ -214,7 +218,7 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 ```bash
 npm install
 npm run typecheck        # tsc --noEmit
-npm test                 # 97 项：49 单元 + 15 端到端 + 3 admin HTTP + 30 A2A
+npm test                 # 110 项：52 单元 + 5 硬化 + 19 端到端 + 3 admin HTTP + 31 A2A
 npm run test:stress      # 压力：高并发 / 反复 cancel-reply / hang 超时
 npm run test:fault       # 故障：磁盘/权限异常的优雅降级
 npm run verify           # 门禁：typecheck + npm test + stress + fault + release 构建
@@ -287,6 +291,7 @@ scripts/
 
 | 版本 | 要点 |
 |---|---|
+| **0.4.1** | 修复 `input-required` 暂停期丢失已写文件（续跑前自动回放暂停时的 patch，失败则 fail closed 而非在残缺树上继续）+ patch 产物持久化（桥重启后仍可续跑）+ `captureDiff --binary` + 续跑拒绝静默换档 + 流式缓冲硬上限 + blocking 断连不再空转，110 项测试 |
 | **0.4.0** | A+ 路线图收尾：消费 `configuration.blocking`/`acceptedOutputModes`/`historyLength`、JSON-RPC 通知不回包、令牌桶限流、CORS、`unhandledRejection` 阈值退出、`bridge_shutdown` flush、worktree `try/finally` 清理、`src/artifacts.ts` 解耦、skill 多扩展点、**A2A v1.0 迁移路线**（`compat.ts` 双版本序列化），97 项测试 |
 | **0.3.4** | A2A 真互联：Agent Card 发现 + JSON-RPC 语义层（message/send、tasks/get、tasks/cancel、message/stream SSE、push 通知、Bearer 鉴权）；生产级硬化（LRU 保 input-required、文件产物可寻址、SSRF 防护、资源/并发修复、/healthz /metrics /version），83 项测试 |
 | **0.3.3** | P3 加固：可选事件 JSONL 持久化、压力/故障测试、Node 镜像与离线包、Windows CI、metrics 说明 |
