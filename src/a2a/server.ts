@@ -293,14 +293,24 @@ function applyCors(req: http.IncomingMessage, res: http.ServerResponse, config: 
   if (!origins || origins.length === 0) return;
   const origin = req.headers['origin'];
   if (!origin || typeof origin !== 'string') return;
-  if (origins.includes('*') || origins.includes(origin)) {
-    // Reflect the specific origin (never '*') so credentials remain permitted.
-    res.setHeader('access-control-allow-origin', origin);
+  const wildcard = origins.includes('*');
+  if (!wildcard && !origins.includes(origin)) return;
+  // Reflect the specific origin (never '*') so that per-origin Vary caching
+  // stays meaningful.
+  res.setHeader('access-control-allow-origin', origin);
+  // `allow-credentials` on a reflected origin means the browser will attach
+  // cookies/authorization to cross-origin calls and let the calling script read
+  // the response - for *every* origin when the list is a wildcard. It is
+  // therefore opt-in only, and config load rejects the wildcard combo outright.
+  if (config.a2aCorsAllowCredentials) {
     res.setHeader('access-control-allow-credentials', 'true');
-    res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
-    res.setHeader('access-control-allow-headers', 'content-type,authorization,x-a2a-token');
-    res.setHeader('access-control-max-age', '600');
   }
+  // The body of the response now varies by request Origin; without this a
+  // shared cache can serve one origin's response to another.
+  res.setHeader('vary', 'origin');
+  res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
+  res.setHeader('access-control-allow-headers', 'content-type,authorization,x-a2a-token');
+  res.setHeader('access-control-max-age', '600');
 }
 
 function sendJson(res: http.ServerResponse, code: number, body: unknown): void {

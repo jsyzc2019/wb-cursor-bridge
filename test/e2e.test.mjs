@@ -135,8 +135,16 @@ test('e2e: execute job is isolated in a worktree and its patch is captured', asy
     assert.ok(diff.data.changedFiles.includes('changed-by-fake.txt'));
     assert.equal(typeof diff.data.patch, 'string');
 
-    // The worktree must be gone once the job settles.
-    assert.deepEqual(readdirSync(path.join(stateDir, 'worktrees')), []);
+    // The worktree must be gone once the job settles. The per-instance
+    // container itself stays behind holding only its owner record, so that
+    // sibling instances can tell it apart from an abandoned directory.
+    const containers = readdirSync(path.join(stateDir, 'worktrees'));
+    assert.equal(containers.length, 1, `expected one instance container, got ${JSON.stringify(containers)}`);
+    assert.deepEqual(
+      readdirSync(path.join(stateDir, 'worktrees', containers[0])),
+      ['owner.json'],
+      'no worktree should remain after the job settles',
+    );
   } finally {
     await client.close();
     rmSync(stateDir, { recursive: true, force: true });
@@ -616,6 +624,96 @@ test('e2e: optional event JSONL persistence survives the job lifecycle', async (
     assert.ok(types.includes('end'), `expected end event, got ${types.join(',')}`);
   } finally {
     await client.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+/* ---------------------------------------------------------------------------
+ * Multi-instance coexistence on one state directory.
+ *
+ * Every MCP session spawns its own bridge and all of them resolve the same
+ * default state directory, so two live instances are the normal case, not a
+ * misconfiguration. Historically the second one deleted every worktree under
+ * `<stateDir>/worktrees` on startup - including the checkout the first one was
+ * executing inside.
+ * ------------------------------------------------------------------------- */
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Find the worker's live worktree file, whatever the container layout is. */
+function findWorktreeFile(stateDir, name) {
+  const walk = (dir, depth) => {
+    if (depth > 3 || !existsSync(dir)) return undefined;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return undefined;
+    }
+    for (const e of entries) {
+      if (e.isFile() && e.name === name) return path.join(dir, e.name);
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        const hit = walk(path.join(dir, e.name), depth + 1);
+        if (hit) return hit;
+      }
+    }
+    return undefined;
+  };
+  return walk(path.join(stateDir, 'worktrees'), 0);
+}
+
+test('e2e(P0-C): a sibling bridge on the same stateDir does not wipe a running worktree', async () => {
+  const repo = makeRepo();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbstate-shared-'));
+  const { client: a } = startClient(repo, {
+    CURSOR_BRIDGE_STATE_DIR: stateDir,
+    WB_FAKE_MODE: 'slow-write',
+  });
+  let b;
+  try {
+    await a.init();
+    const started = await a.call('cursor_run', {
+      prompt: 'slow implementation', workspace: repo, tier: 'execute',
+    });
+    const jobId = started.data.jobId;
+
+    // Wait until the worker is genuinely inside its worktree with a file written.
+    const deadline = Date.now() + 10_000;
+    let live;
+    while (!live && Date.now() < deadline) {
+      live = findWorktreeFile(stateDir, 'slow-first.txt');
+      if (!live) await sleep(100);
+    }
+    assert.ok(live, 'the worker should have created a worktree and written a file');
+    const liveWtDir = path.dirname(live);
+
+    // Second MCP session: same state directory, its own bridge process.
+    b = startClient(repo, {
+      CURSOR_BRIDGE_STATE_DIR: stateDir,
+      WB_FAKE_MODE: 'ok',
+    }).client;
+    await b.init();
+    await sleep(600); // let B's startup reclaim and index load run
+
+    assert.ok(existsSync(liveWtDir), 'a starting sibling must not delete a live worktree');
+
+    // B must not read A's running job as a crash.
+    const view = await b.call('cursor_status', { jobId });
+    assert.notEqual(view.data.status, 'orphaned', 'a live sibling job is not orphaned');
+
+    const done = await waitFor(a, jobId);
+    assert.equal(done.status, 'completed', 'the job must finish, not die with its cwd');
+    assert.ok(done.changedFiles.includes('slow-first.txt'));
+    assert.ok(done.changedFiles.includes('slow-second.txt'));
+    const patch = readFileSync(done.patchFile, 'utf8');
+    assert.match(patch, /slow-first\.txt/);
+    assert.match(patch, /slow-second\.txt/);
+  } finally {
+    if (b) await b.close();
+    await a.close();
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(repo, { recursive: true, force: true });
   }

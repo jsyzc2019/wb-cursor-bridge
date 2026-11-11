@@ -21,6 +21,7 @@ import {
   type Worktree,
 } from './util/git.js';
 import { concurrency, badArgument } from './errors.js';
+import { claimInstanceDir, currentInstanceId, worktreeRoot } from './util/instance.js';
 import type { Config } from './config.js';
 import type { Job, JobStatus, JobView, StartJobOptions, Tier } from './types.js';
 import type { Logger } from './logger.js';
@@ -55,6 +56,8 @@ export interface Metrics {
 
 export class JobManager {
   readonly store: JobStore;
+  /** Per-instance worktree container, so concurrent bridges sharing a stateDir never collide. */
+  readonly worktreeDir: string;
   private cfg: Config;
   private log: Logger;
   private inflight = new Map<string, AbortController>();
@@ -76,6 +79,7 @@ export class JobManager {
   constructor(cfg: Config, log: Logger) {
     this.cfg = cfg;
     this.log = log.child('jobs');
+    this.worktreeDir = this.resolveWorktreeDir();
     this.store = new JobStore(
       cfg.stateDir,
       {
@@ -84,6 +88,7 @@ export class JobManager {
       },
       this.log.child('store'),
       cfg.eventLogDir,
+      currentInstanceId(),
     );
     const { orphaned } = this.store.load();
     this.metrics.orphanedOnBoot = orphaned.length;
@@ -92,6 +97,25 @@ export class JobManager {
         count: orphaned.length,
         ids: orphaned.slice(0, 5),
       });
+    }
+  }
+
+  /**
+   * Claim this instance's worktree container. Falls back to the legacy shared
+   * directory (with a warning) when the state directory is not writable:
+   * degrading isolation beats refusing to boot, and in that case worktrees
+   * cannot be created anyway.
+   */
+  private resolveWorktreeDir(): string {
+    try {
+      return claimInstanceDir(this.cfg.stateDir);
+    } catch (err) {
+      const fallback = worktreeRoot(this.cfg.stateDir);
+      this.log.warn('could not claim per-instance worktree directory; using shared layout', {
+        dir: fallback,
+        err: String((err as Error)?.message ?? err),
+      });
+      return fallback;
     }
   }
 
@@ -234,7 +258,7 @@ export class JobManager {
         worktree = await createWorktree(
           job.workspace,
           `wb-${job.id.slice(0, 8)}`,
-          path.join(this.cfg.stateDir, 'worktrees'),
+          this.worktreeDir,
         );
         // Only downgrade the intent recorded at dispatch time.
         job.isolation = worktree ? 'bridge-worktree' : 'cursor-worktree';

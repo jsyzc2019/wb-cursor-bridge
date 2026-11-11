@@ -16,6 +16,7 @@ import path from 'node:path';
 import type { Job, JobEvent, JobStatus } from './types.js';
 import { notFound } from './errors.js';
 import type { Logger } from './logger.js';
+import { currentInstanceId, pidAlive } from './util/instance.js';
 
 export interface StoreLimits {
   maxJobs: number;
@@ -51,36 +52,46 @@ export function isLive(s: JobStatus): boolean {
   return s === 'running' || s === 'input-required';
 }
 
+type PersistedJob = Pick<
+  Job,
+  | 'id'
+  | 'tier'
+  | 'workspace'
+  | 'prompt'
+  | 'status'
+  | 'createdAt'
+  | 'finishedAt'
+  | 'threadId'
+  | 'contextId'
+  | 'metadata'
+  | 'parentJobId'
+  | 'exitCode'
+  | 'durationMs'
+  | 'truncated'
+  | 'pendingInput'
+  | 'inputRequiredAt'
+  | 'model'
+  | 'isolation'
+  | 'changedFiles'
+  | 'diffStat'
+  | 'patchFile'
+  | 'reportFile'
+> & {
+  /**
+   * Instance that wrote this record.
+   *
+   * Two bridges can share one state directory (MCP clients spawn one bridge per
+   * session and they all resolve the same default). Without this, each one saw
+   * the other's `running` job, assumed it had crashed, and marked it orphaned -
+   * a state that then flip-flopped every time either side persisted.
+   */
+  owner?: string;
+};
+
 interface PersistedIndex {
   version: 1;
   updatedAt: string;
-  jobs: Array<
-    Pick<
-      Job,
-      | 'id'
-      | 'tier'
-      | 'workspace'
-      | 'prompt'
-      | 'status'
-      | 'createdAt'
-      | 'finishedAt'
-      | 'threadId'
-      | 'contextId'
-      | 'metadata'
-      | 'parentJobId'
-      | 'exitCode'
-      | 'durationMs'
-      | 'truncated'
-      | 'pendingInput'
-      | 'inputRequiredAt'
-      | 'model'
-      | 'isolation'
-      | 'changedFiles'
-      | 'diffStat'
-      | 'patchFile'
-      | 'reportFile'
-    >
-  >;
+  jobs: PersistedJob[];
 }
 
 export class JobStore {
@@ -92,6 +103,12 @@ export class JobStore {
   private log?: Logger;
   private persistFailures = 0;
   private eventLogDir?: string;
+  /** Identity of the index file as of our last read/write, to detect a sibling instance. */
+  private lastSnapshot = '';
+  /** Id of the bridge process this store belongs to. */
+  private instanceId: string;
+  /** Jobs created here: our in-memory copy is authoritative for these. */
+  private owned = new Set<string>();
   /** Buffered JSONL lines waiting for the next async flush. */
   private pendingEvents = new Map<string, string[]>();
   /** In-flight flush promises, so flushNow() can await durability. */
@@ -103,11 +120,13 @@ export class JobStore {
     limits: StoreLimits,
     log?: Logger,
     eventLogDir?: string,
+    instanceId: string = currentInstanceId(),
   ) {
     this.limits = limits;
     this.indexFile = path.join(stateDir, 'index.json');
     this.log = log;
     this.eventLogDir = eventLogDir;
+    this.instanceId = instanceId;
     try {
       fs.mkdirSync(stateDir, { recursive: true });
     } catch (err) {
@@ -126,13 +145,26 @@ export class JobStore {
     try {
       parsed = JSON.parse(fs.readFileSync(this.indexFile, 'utf8')) as PersistedIndex;
     } catch {
+      // Remember the (missing) file's identity so the first persist does not
+      // treat its own write as a foreign one.
+      this.lastSnapshot = this.snapshotKey();
       return { orphaned: [] };
     }
+    this.lastSnapshot = this.snapshotKey();
     const orphaned: string[] = [];
     for (const meta of parsed.jobs ?? []) {
-      const status: JobStatus =
-        meta.status === 'running' ? 'orphaned' : meta.status;
-      if (meta.status === 'running') orphaned.push(meta.id);
+      let status: JobStatus = meta.status;
+      if (meta.status === 'running') {
+        if (this.ownerStillAlive(meta.owner)) {
+          // A sibling bridge on this host is running it right now. Marking it
+          // orphaned would make the two instances rewrite each other's status
+          // on every persist.
+          status = 'running';
+        } else {
+          status = 'orphaned';
+          orphaned.push(meta.id);
+        }
+      }
       this.jobs.set(meta.id, {
         ...meta,
         status,
@@ -149,6 +181,7 @@ export class JobStore {
 
   create(job: Job): Job {
     this.jobs.set(job.id, job);
+    this.owned.add(job.id);
     this.evict();
     // Persist immediately: if the process is hard-killed seconds from now, the
     // job must still be discoverable on the next boot and marked orphaned.
@@ -248,7 +281,85 @@ export class JobStore {
     this.flushTimer.unref?.();
   }
 
+  /**
+   * True when a `running` record belongs to another bridge on this host whose
+   * process is still alive.
+   *
+   * Our own records are never "foreign": a fresh process cannot hold a job it
+   * has not re-created, so a running record bearing our id is a genuine crash
+   * leftover and must be orphaned.
+   */
+  private ownerStillAlive(owner: string | undefined): boolean {
+    if (!owner || owner === this.instanceId) return false;
+    const pid = Number.parseInt(owner.split('-')[0] ?? '', 10);
+    return Number.isInteger(pid) && pid > 0 && pidAlive(pid);
+  }
+
+  /** Cheap identity for the index file; mtime alone is too coarse on some filesystems. */
+  private snapshotKey(): string {
+    try {
+      const st = fs.statSync(this.indexFile);
+      return `${st.mtimeMs}:${st.size}`;
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Adopt jobs written by a sibling bridge that shares this state directory.
+   *
+   * Every MCP session spawns its own bridge and they all resolve the same
+   * default state directory, so two live instances are normal. Each keeps the
+   * index in memory and writes it back wholesale, which meant the second writer
+   * erased the first one's history. Re-reading before writing makes the two
+   * histories converge instead of clobbering each other.
+   */
+  private absorbForeignWrites(): void {
+    const key = this.snapshotKey();
+    if (key === this.lastSnapshot) return; // unchanged since our last read/write
+    this.lastSnapshot = key;
+    if (key === '') return;
+    let parsed: PersistedIndex;
+    try {
+      parsed = JSON.parse(fs.readFileSync(this.indexFile, 'utf8')) as PersistedIndex;
+    } catch {
+      return; // unreadable: keep ours rather than throwing the write away
+    }
+    let adopted = 0;
+    let refreshed = 0;
+    for (const meta of parsed.jobs ?? []) {
+      if (!meta?.id) continue;
+      const mine = this.jobs.get(meta.id);
+      if (!mine) {
+        this.jobs.set(meta.id, { ...meta, events: [], cursor: 0, result: undefined });
+        adopted += 1;
+        continue;
+      }
+      // We are authoritative only for jobs we created in *this* process. For
+      // everything else the on-disk copy wins: otherwise a sibling's completed
+      // job would be rewritten as whatever stale state we happened to hold.
+      if (this.owned.has(meta.id)) continue;
+      this.jobs.set(meta.id, {
+        ...meta,
+        events: mine.events,
+        cursor: mine.cursor,
+        result: mine.result,
+      });
+      refreshed += 1;
+    }
+    if (adopted > 0 || refreshed > 0) {
+      this.evict();
+      this.log?.warn('merged index written by another bridge instance', {
+        adopted,
+        refreshed,
+        file: this.indexFile,
+        hint: 'prefer a distinct CURSOR_BRIDGE_STATE_DIR per instance; history is merged, not lost',
+      });
+    }
+  }
+
   persist(): void {
+    this.absorbForeignWrites();
     const payload: PersistedIndex = {
       version: 1,
       updatedAt: new Date().toISOString(),
@@ -279,6 +390,7 @@ export class JobStore {
         diffStat: j.diffStat,
         patchFile: j.patchFile,
         reportFile: j.reportFile,
+        owner: this.instanceId,
       })),
     };
     try {
@@ -288,6 +400,7 @@ export class JobStore {
       fs.renameSync(tmp, this.indexFile);
       this.dirty = false;
       this.persistFailures = 0;
+      this.lastSnapshot = this.snapshotKey();
     } catch (err) {
       this.persistFailures += 1;
       this.log?.error('index persist failed', {

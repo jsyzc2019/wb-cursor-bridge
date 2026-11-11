@@ -177,17 +177,19 @@ export async function removeWorktree(wt: Worktree): Promise<void> {
   }
 }
 
-/** Drop every worktree this bridge owns; run at startup and on exit. */
-export async function pruneOwnedWorktrees(repo: string, containerDir: string): Promise<void> {
+/**
+ * Drop stale git worktree *metadata* for a repo.
+ *
+ * This only removes bookkeeping entries whose checkout directory is already
+ * gone - it never deletes a live checkout. Reclaiming actual directories is
+ * the job of `pruneStaleInstanceDirs`, which knows which owner still exists;
+ * the previous version deleted every directory under the shared
+ * `<stateDir>/worktrees`, so a second bridge starting up would wipe the
+ * worktrees a first, still-running bridge was executing inside.
+ */
+export async function pruneWorktreeMetadata(repo: string): Promise<void> {
   try {
     await git(repo, ['worktree', 'prune'], 15_000);
-  } catch {
-    /* ignore */
-  }
-  try {
-    for (const entry of fs.readdirSync(containerDir)) {
-      fs.rmSync(path.join(containerDir, entry), { recursive: true, force: true });
-    }
   } catch {
     /* ignore */
   }

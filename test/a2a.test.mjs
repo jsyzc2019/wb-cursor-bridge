@@ -937,6 +937,65 @@ test('a2a(P2#15): CORS headers are absent when not configured', async () => {
   }
 });
 
+/* ------------------------------------------------- CORS credentials hardening */
+
+const corsProbe = (base, origin) =>
+  fetch(`${base}/a2a`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tasks/get', params: { id: 'nope' } }),
+  });
+
+test('a2a(CORS): a wildcard origin never grants credentials', async () => {
+  const repo = makeRepo();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbstate-cors-star-'));
+  const { server, base } = await startServer(
+    makeConfig(repo, stateDir, { a2aCorsOrigins: ['*'] }),
+    new Logger({ level: 'error', fileDir: stateDir }),
+  );
+  try {
+    // Reflecting an arbitrary origin while allowing credentials would let any
+    // website read authenticated bridge responses.
+    const res = await corsProbe(base, 'http://anywhere.example.com');
+    assert.equal(res.headers.get('access-control-allow-origin'), 'http://anywhere.example.com');
+    assert.equal(
+      res.headers.get('access-control-allow-credentials'),
+      null,
+      'a wildcard must not be paired with allow-credentials',
+    );
+    assert.match(res.headers.get('vary') ?? '', /origin/i, 'reflected origin must set Vary');
+  } finally {
+    server.close();
+    await rmSafe(stateDir);
+    await rmSafe(repo);
+  }
+});
+
+test('a2a(CORS): credentials are emitted only when explicitly enabled for an exact origin', async () => {
+  const repo = makeRepo();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbstate-cors-cred-'));
+  const { server, base } = await startServer(
+    makeConfig(repo, stateDir, {
+      a2aCorsOrigins: ['http://console.example.com'],
+      a2aCorsAllowCredentials: true,
+    }),
+    new Logger({ level: 'error', fileDir: stateDir }),
+  );
+  try {
+    const ok = await corsProbe(base, 'http://console.example.com');
+    assert.equal(ok.headers.get('access-control-allow-origin'), 'http://console.example.com');
+    assert.equal(ok.headers.get('access-control-allow-credentials'), 'true');
+
+    const denied = await corsProbe(base, 'http://evil.example.com');
+    assert.equal(denied.headers.get('access-control-allow-origin'), null);
+    assert.equal(denied.headers.get('access-control-allow-credentials'), null);
+  } finally {
+    server.close();
+    await rmSafe(stateDir);
+    await rmSafe(repo);
+  }
+});
+
 /* ---------------------------------------------------- Phase 3 #19: A2A v1.0 migration route */
 
 test('a2a(P3#19): v1.0 Agent Card drops top-level protocolVersion for supportedInterfaces', async () => {

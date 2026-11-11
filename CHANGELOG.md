@@ -4,9 +4,72 @@
 `src/version.ts` 是版本号的唯一来源，测试会断言其与 `package.json` 一致——
 版本不一致无法通过测试，因此不可能发出版本号错乱的包。
 
+## 0.4.2 — 配置严格化 + CORS 凭证收敛 + 多实例共存
+
+全仓测试 **110 → 129** 项（68 单元 + 5 硬化 + 20 端到端 + 3 admin + 33 A2A），
+`verify:e2e` 54 项全过。三项都属于"不报错但结果不对"的静默故障。
+
+### 修复：非法配置值不再静默回退
+
+`num()` 把解析失败当作"用默认值"，于是 `CURSOR_BRIDGE_TIMEOUT_SEC=15m` 被静默换成
+900 秒——运维以为超时是 15 分钟，任务实际跑了 15 小时才被杀。实测六个非法值全部被接受：
+
+| 环境变量 | 修复前 | 修复后 |
+|---|---|---|
+| `CURSOR_BRIDGE_TIMEOUT_SEC=15m` | 静默用 900 | 启动失败，错误信息点名该键 |
+| `CURSOR_BRIDGE_MAX_JOBS=lots` | 静默用 100 | 启动失败 |
+| `CURSOR_BRIDGE_LOG_LEVEL=verbose` | 原样透传 | 启动失败 |
+| `CURSOR_BRIDGE_FORCE_WORKTREE=ture` | 静默按 false | 启动失败 |
+| `CURSOR_BRIDGE_A2A_PROTOCOL_VERSION=2.0` | 静默按 0.3.0 | 启动失败 |
+| 通配 CORS + 允许凭证 | 接受 | 启动失败 |
+
+- `num()`：环境变量显式给出却不可解析时抛 `badConfig`，信息含键名与示例值；配置文件
+  里的非数字同样拒绝（数字字符串仍兼容）。
+- `bool()`：只接受 `1/0`、`true/false`、`yes/no`、`on/off`。`=ture` 以前被读成
+  false，等于静默关掉了功能。
+- `logLevel`：限定 `debug|info|warn|error`。未知等级会让比较落到"全记"或"全丢"，
+  取决于比较顺序，等于把告警关掉了还不知道。
+- `a2aProtocolVersion`：限定 `0.3.0|1.0`。
+
+### 修复：CORS 通配不再授予凭证
+
+`applyCors` 命中 `*` 时反射任意 `Origin`，并无条件发送
+`access-control-allow-credentials: true`——**任何网站都能带凭证读取桥的响应**。实测
+`Origin: http://anywhere.example.com` 得到反射 origin + `allow-credentials: true`。
+
+- 新增 `CURSOR_BRIDGE_A2A_CORS_ALLOW_CREDENTIALS`（默认关闭）：只有显式开启且来源为
+  精确列表时才发送 `allow-credentials`。
+- 通配 `*` 与"允许凭证"同时出现时**拒绝启动**（该组合没有合法用途）。
+- 反射来源时补 `Vary: origin`，避免共享缓存把一个来源的响应发给另一个。
+
+### 修复：多实例共享 stateDir 互相删除 worktree
+
+MCP 客户端每个会话起一个 bridge，且都解析到同一个默认 stateDir，所以"两个实例同时
+活着"是常态而非误配。旧启动清理会**删光** `<stateDir>/worktrees` 下的所有目录：第二个
+会话启动时，第一个会话正在执行的 worktree 被删除，worker 的 `cwd` 消失，任务以无关
+错误失败。实测：兄弟实例启动后，运行中任务的 worktree 从存在变为不存在。
+
+- 新增 `src/util/instance.ts`：worktree 落在 `<stateDir>/worktrees/<instanceId>/`，
+  目录内写 `owner.json`（pid / hostname / instanceId / startedAt）。
+- 启动清理改为 `pruneStaleInstanceDirs`：只回收**同主机且 pid 已不存在**的实例目录；
+  跨主机（网络盘）一律不动；无 owner 记录的旧布局目录超过 6 小时才回收。
+- `pruneOwnedWorktrees` → `pruneWorktreeMetadata`：只跑 `git worktree prune` 清元数据，
+  **不再删除任何目录**。
+- `index.json` 增加 `owner` 字段：加载时只有"本实例"的 running 任务才算崩溃孤儿，兄弟
+  实例的存活任务保持 running（否则两边会来回把对方改成 orphaned）。
+- 写入前按 mtime+size 检测他人写入并合并：不是本进程创建的 job 以磁盘版本为准，
+  兄弟实例的 completed 不会被回滚成旧状态。
+- 检测到同主机存活兄弟实例时告警，提示可用独立 `CURSOR_BRIDGE_STATE_DIR` 隔离历史。
+
+### 测试
+
+新增 19 项（unit 16 + a2a 2 + e2e 1）：配置拒绝 7、实例目录回收语义 5（存活 / 已死 /
+跨主机 / 旧布局 / pidAlive）、store 多实例合并 4、CORS 凭证 2、兄弟实例不删运行中
+worktree 1（真实 git worktree + 假 Agent，修复前该断言为 `false`）。
+
 ## 0.4.1 — 中断续跑不再丢工作 + 失败路径硬化
 
-全仓测试 **97 → 105** 项（49 单元 + 5 硬化 + 18 端到端 + 3 admin + 30 A2A），
+全仓测试 **97 → 110** 项（52 单元 + 5 硬化 + 19 端到端 + 3 admin + 31 A2A），
 `verify:e2e` 54 项全过。所有条目都有先红后绿的回归用例，修复前的失败原因已实测记录。
 
 ### 修复：`input-required` 暂停期丢失已完成的改动（P0，数据丢失）

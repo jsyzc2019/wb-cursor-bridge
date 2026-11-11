@@ -193,7 +193,8 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 | `a2aProtocolVersion` / `CURSOR_BRIDGE_A2A_PROTOCOL_VERSION` | `0.3.0` | A2A 协议版本；设为 `1.0` 即输出 v1.0 合规的 Agent Card 与 Task（FileContent 字段重映射 `name→filename`/`mimeType→mediaType`/`uri→url`/`bytes_inline→raw`、`protocolVersion` 移入 `supportedInterfaces`、新增 `extensions[]`）。默认 `0.3.0` 保持零回归 |
 | `a2aBlockingMaxMs` / `CURSOR_BRIDGE_A2A_BLOCKING_MAX_MS` | `90000` | `message/send` 在 `configuration.blocking` 为真时阻塞等待任务终态的上限（ms），区间 `[1000, 600000]`；超时回异步 task |
 | `a2aRateLimitPerSec` / `CURSOR_BRIDGE_A2A_RATE_LIMIT_PER_SEC` | `250` | `POST /a2a` 令牌桶限流速率（请求/秒），区间 `[1, 100000]`；超限返回 `429 RATE_LIMITED(-32050)` |
-| `a2aCorsOrigins` / `CURSOR_BRIDGE_A2A_CORS_ORIGINS` | 空 | 逗号分隔的允许跨域 origin 列表；命中时反射 `Access-Control-Allow-Origin`，默认关闭（不输出任何 CORS 头） |
+| `a2aCorsOrigins` / `CURSOR_BRIDGE_A2A_CORS_ORIGINS` | 空 | 逗号分隔的允许跨域 origin 列表；命中时反射 `Access-Control-Allow-Origin`（并带 `Vary: origin`），默认关闭（不输出任何 CORS 头） |
+| `a2aCorsAllowCredentials` / `CURSOR_BRIDGE_A2A_CORS_ALLOW_CREDENTIALS` | `false` | 为允许的来源发送 `Access-Control-Allow-Credentials`。与通配 `*` 组合会在启动时被拒绝——反射任意来源又允许凭证等于全网可读 |
 | `a2aSkills` / `file.a2aSkills` | 空 | 额外 skill 声明（`ExtraSkill[]`：`{ id, name, root, description?, tags?, tier? }`），`root` 自动 `expandPath` 且须落在 `workspaceRoots` 内，越界被 `log.warn` 丢弃 |
 
 ---
@@ -218,7 +219,7 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 ```bash
 npm install
 npm run typecheck        # tsc --noEmit
-npm test                 # 110 项：52 单元 + 5 硬化 + 19 端到端 + 3 admin HTTP + 31 A2A
+npm test                 # 129 项：68 单元 + 5 硬化 + 20 端到端 + 3 admin HTTP + 33 A2A
 npm run test:stress      # 压力：高并发 / 反复 cancel-reply / hang 超时
 npm run test:fault       # 故障：磁盘/权限异常的优雅降级
 npm run verify           # 门禁：typecheck + npm test + stress + fault + release 构建
@@ -291,6 +292,7 @@ scripts/
 
 | 版本 | 要点 |
 |---|---|
+| **0.4.2** | 非法配置不再静默回退（`=15m` 以前会变成 900s）、CORS 通配不再授予凭证、多实例共享 stateDir 不再互删 worktree（`worktrees/<instanceId>/` + `owner.json`，`index.json` 记 owner 避免误判孤儿），129 项测试 |
 | **0.4.1** | 修复 `input-required` 暂停期丢失已写文件（续跑前自动回放暂停时的 patch，失败则 fail closed 而非在残缺树上继续）+ patch 产物持久化（桥重启后仍可续跑）+ `captureDiff --binary` + 续跑拒绝静默换档 + 流式缓冲硬上限 + blocking 断连不再空转，110 项测试 |
 | **0.4.0** | A+ 路线图收尾：消费 `configuration.blocking`/`acceptedOutputModes`/`historyLength`、JSON-RPC 通知不回包、令牌桶限流、CORS、`unhandledRejection` 阈值退出、`bridge_shutdown` flush、worktree `try/finally` 清理、`src/artifacts.ts` 解耦、skill 多扩展点、**A2A v1.0 迁移路线**（`compat.ts` 双版本序列化），97 项测试 |
 | **0.3.4** | A2A 真互联：Agent Card 发现 + JSON-RPC 语义层（message/send、tasks/get、tasks/cancel、message/stream SSE、push 通知、Bearer 鉴权）；生产级硬化（LRU 保 input-required、文件产物可寻址、SSRF 防护、资源/并发修复、/healthz /metrics /version），83 项测试 |

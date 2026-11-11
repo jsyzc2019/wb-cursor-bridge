@@ -37,6 +37,24 @@ if (mode === 'write') {
 }
 
 /**
+ * WB_FAKE_MODE=slow-write: write a file, stay alive long enough for a sibling
+ * bridge to boot on the same state directory, then write a second file.
+ *
+ * Regression probe for multi-instance startup reclaim: if the second bridge
+ * deletes this worker's worktree, the `cwd` disappears mid-task and the second
+ * write fails, so the job cannot complete.
+ */
+if (mode === 'slow-write') {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  fs.writeFileSync(path.join(process.cwd(), 'slow-first.txt'), 'first\n');
+  out({ type: 'tool_call', tool_call: { writeToolCall: { args: { path: 'slow-first.txt' } } } });
+  await sleep(2500);
+  fs.writeFileSync(path.join(process.cwd(), 'slow-second.txt'), 'second\n');
+  out({ type: 'tool_call', tool_call: { writeToolCall: { args: { path: 'slow-second.txt' } } } });
+}
+
+/**
  * WB_FAKE_MODE=needinput-write: write a file, THEN ask the question.
  *
  * The resumed pass reports whether that file survived the pause. This is the

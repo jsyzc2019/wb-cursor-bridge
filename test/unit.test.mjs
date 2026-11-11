@@ -353,6 +353,102 @@ test('JobStore: marks jobs left running by a crash as orphaned', () => {
   }
 });
 
+test('JobStore: a sibling instance writing the index does not erase our jobs', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'wbstore-shared-'));
+  try {
+    const limits = { maxJobs: 10, maxEventsPerJob: 100 };
+    const a = new JobStore(dir, limits);
+    a.load();
+    a.create(mkJob('a1', 'completed'));
+
+    // Second bridge on the same stateDir (one per MCP session, same default
+    // directory): it loads, then writes its own job.
+    const b = new JobStore(dir, limits);
+    b.load();
+    b.create(mkJob('b1', 'completed'));
+
+    // A's next write used to clobber the file with only A's jobs.
+    a.create(mkJob('a2', 'completed'));
+
+    const onDisk = JSON.parse(readFileSync(path.join(dir, 'index.json'), 'utf8'));
+    const ids = onDisk.jobs.map((j) => j.id).sort();
+    assert.deepEqual(ids, ['a1', 'a2', 'b1'], 'both histories must survive');
+    assert.ok(a.get('b1'), 'the sibling job is adopted into memory too');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('JobStore: a sibling instance does not orphan our running job', async () => {
+  const { currentInstanceId } = await import('../dist/util/instance.js');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'wbstore-sibling-'));
+  try {
+    const limits = { maxJobs: 10, maxEventsPerJob: 100 };
+    const a = new JobStore(dir, limits, undefined, undefined, currentInstanceId());
+    a.load();
+    a.create(mkJob('live', 'running'));
+    a.flushNow();
+
+    // A second bridge on the same stateDir must not assume our live job crashed.
+    const b = new JobStore(dir, limits, undefined, undefined, 'another-instance');
+    const { orphaned } = b.load();
+    assert.deepEqual(orphaned, [], 'a job owned by a live instance is not an orphan');
+    assert.equal(b.get('live').status, 'running');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('JobStore: a job left running by our own crashed process is still orphaned', async () => {
+  const { currentInstanceId } = await import('../dist/util/instance.js');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'wbstore-restart-'));
+  try {
+    const limits = { maxJobs: 10, maxEventsPerJob: 100 };
+    const id = currentInstanceId();
+    const first = new JobStore(dir, limits, undefined, undefined, id);
+    first.create(mkJob('crashed', 'running'));
+    first.flushNow();
+
+    // Same instance id, fresh process state: nothing is running it any more.
+    const restarted = new JobStore(dir, limits, undefined, undefined, id);
+    const { orphaned } = restarted.load();
+    assert.deepEqual(orphaned, ['crashed']);
+    assert.equal(restarted.get('crashed').status, 'orphaned');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('JobStore: a sibling completion is never rolled back to a stale state', async () => {
+  const { currentInstanceId } = await import('../dist/util/instance.js');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'wbstore-stale-'));
+  try {
+    const limits = { maxJobs: 10, maxEventsPerJob: 100 };
+    const a = new JobStore(dir, limits, undefined, undefined, currentInstanceId());
+    a.load();
+    a.create(mkJob('j1', 'running'));
+    a.flushNow();
+
+    // B loads the running job; it belongs to a live instance, so B must not
+    // declare it orphaned.
+    const b = new JobStore(dir, limits, undefined, undefined, `${process.pid}-sibling-b`);
+    b.load();
+    assert.equal(b.get('j1').status, 'running', 'a live sibling job stays running');
+
+    // A finishes it on disk.
+    a.jobs.set('j1', mkJob('j1', 'completed'));
+    a.persist();
+
+    // B's next write must not resurrect "running" for j1.
+    b.persist();
+    const onDisk = JSON.parse(readFileSync(path.join(dir, 'index.json'), 'utf8'));
+    const j1 = onDisk.jobs.find((j) => j.id === 'j1');
+    assert.equal(j1.status, 'completed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('JobStore: evicts oldest finished jobs over the cap, keeps running ones', () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'wbstore-'));
   try {
@@ -572,6 +668,77 @@ test('JobManager.view: exposes A2A-style artifacts derived from deliverables', (
 
 const { loadConfig } = await import('../dist/config.js');
 
+/** Run `fn` with a temporary environment, restoring every touched key. */
+function withEnv(vars, fn) {
+  const prev = new Map();
+  for (const [k, v] of Object.entries(vars)) {
+    prev.set(k, process.env[k]);
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [k, v] of prev) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test('loadConfig: a non-numeric env value fails loudly instead of silently using the default', () => {
+  // `=15m` used to parse as NaN and be swapped for the 900s default: the
+  // operator believed the timeout was 15 minutes while jobs ran for up to 15h.
+  withEnv({ CURSOR_BRIDGE_TIMEOUT_SEC: '15m' }, () => {
+    assert.throws(() => loadConfig(), /CURSOR_BRIDGE_TIMEOUT_SEC is not a number/);
+  });
+});
+
+test('loadConfig: valid numeric env values still apply', () => {
+  withEnv({ CURSOR_BRIDGE_TIMEOUT_SEC: '120' }, () => {
+    assert.equal(loadConfig().defaultTimeoutSec, 120);
+  });
+});
+
+test('loadConfig: an unknown log level is rejected rather than silently mapped', () => {
+  withEnv({ CURSOR_BRIDGE_LOG_LEVEL: 'verbose' }, () => {
+    assert.throws(() => loadConfig(), /CURSOR_BRIDGE_LOG_LEVEL/);
+  });
+});
+
+test('loadConfig: an unrecognised boolean is rejected', () => {
+  // `=ture` used to be read as false, silently disabling the feature.
+  withEnv({ CURSOR_BRIDGE_FORCE_WORKTREE: 'ture' }, () => {
+    assert.throws(() => loadConfig(), /CURSOR_BRIDGE_FORCE_WORKTREE/);
+  });
+});
+
+test('loadConfig: an unknown A2A protocol version is rejected', () => {
+  withEnv({ CURSOR_BRIDGE_A2A_PROTOCOL_VERSION: '2.0' }, () => {
+    assert.throws(() => loadConfig(), /CURSOR_BRIDGE_A2A_PROTOCOL_VERSION/);
+  });
+});
+
+test('loadConfig: wildcard CORS cannot be combined with credentials', () => {
+  withEnv(
+    { CURSOR_BRIDGE_A2A_CORS_ORIGINS: '*', CURSOR_BRIDGE_A2A_CORS_ALLOW_CREDENTIALS: 'true' },
+    () => {
+      assert.throws(() => loadConfig(), /wildcard/);
+    },
+  );
+});
+
+test('loadConfig: wildcard CORS alone loads with credentials off', () => {
+  withEnv(
+    { CURSOR_BRIDGE_A2A_CORS_ORIGINS: '*', CURSOR_BRIDGE_A2A_CORS_ALLOW_CREDENTIALS: undefined },
+    () => {
+      const cfg = loadConfig();
+      assert.deepEqual(cfg.a2aCorsOrigins, ['*']);
+      assert.equal(cfg.a2aCorsAllowCredentials, false);
+    },
+  );
+});
+
 test('loadConfig: an out-of-range value names the offending setting', () => {
   const prev = process.env.CURSOR_BRIDGE_MAX_JOBS;
   process.env.CURSOR_BRIDGE_MAX_JOBS = '1';
@@ -686,4 +853,99 @@ test('compat: toV1Card moves protocolVersion into supportedInterfaces', () => {
   assert.equal(v1.supportedInterfaces[0].protocolVersion, '1.0');
   assert.deepEqual(v1.extensions, [], 'extensions array present');
   assert.equal(v1.url, 'http://h/a2a', 'other fields carried over');
+});
+
+/* --------------------------------------------------------------- instance */
+
+const {
+  claimInstanceDir,
+  pruneStaleInstanceDirs,
+  worktreeRoot,
+  OWNER_FILE,
+  pidAlive,
+} = await import('../dist/util/instance.js');
+
+test('instance: concurrent instances get distinct directories and neither is reclaimed', () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbinst-'));
+  try {
+    const a = claimInstanceDir(stateDir, `a-${process.pid}`);
+    const b = claimInstanceDir(stateDir, `b-${process.pid}`);
+    assert.notEqual(a, b, 'each instance must own its own container');
+    assert.ok(existsSync(path.join(a, OWNER_FILE)));
+    // A third bridge starting up runs the startup reclaim; it must leave both
+    // live directories alone (this is the bug: it used to delete them all).
+    const res = pruneStaleInstanceDirs(stateDir, { selfId: 'a-third-instance' });
+    assert.ok(existsSync(a), 'live instance A keeps its worktrees');
+    assert.ok(existsSync(b), 'live instance B keeps its worktrees');
+    assert.equal(res.removed.length, 0);
+    assert.equal(res.peers.length, 2);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('instance: a directory owned by a dead pid is reclaimed', () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbinst-dead-'));
+  try {
+    const dead = claimInstanceDir(stateDir, 'gone');
+    mkdirSync(path.join(dead, 'wb-job-1234'), { recursive: true });
+    writeFileSync(path.join(dead, 'wb-job-1234', 'f.txt'), 'x');
+    const res = pruneStaleInstanceDirs(stateDir, {
+      selfId: 'elsewhere',
+      isAlive: () => false,
+    });
+    assert.ok(!existsSync(dead), 'dead instance directory is removed');
+    assert.deepEqual(res.removed, [dead]);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('instance: a directory owned by another host is never reclaimed', () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbinst-host-'));
+  try {
+    // owner.json records this machine's hostname; ask the pruner as if we were
+    // a different host, which is the cross-machine network-share case.
+    const dir = claimInstanceDir(stateDir, 'remote');
+    const res = pruneStaleInstanceDirs(stateDir, {
+      selfId: 'me',
+      hostname: 'some-other-host',
+      isAlive: () => false,
+    });
+    assert.ok(existsSync(dir), 'a foreign pid says nothing about liveness');
+    assert.equal(res.removed.length, 0);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('instance: unattributed legacy directories are reclaimed only once stale', () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbinst-legacy-'));
+  try {
+    const root = worktreeRoot(stateDir);
+    const oldDir = path.join(root, 'wb-legacy-old');
+    const newDir = path.join(root, 'wb-legacy-new');
+    for (const dir of [oldDir, newDir]) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(path.join(dir, 'leftover.txt'), 'x');
+    }
+    // Directories written before per-instance layout carry no owner record, so
+    // age is the only signal that their bridge is gone.
+    const old = new Date(Date.now() - 10 * 60 * 60 * 1000);
+    fs.utimesSync(path.join(oldDir, 'leftover.txt'), old, old);
+    fs.utimesSync(oldDir, old, old);
+
+    const res = pruneStaleInstanceDirs(stateDir, { selfId: 'me' });
+    assert.ok(!existsSync(oldDir), 'a 10h-old unattributed directory is reclaimed');
+    assert.ok(existsSync(newDir), 'a fresh unattributed directory is left alone');
+    assert.deepEqual(res.unknown, [newDir]);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('instance: pidAlive distinguishes this process from an impossible pid', () => {
+  assert.equal(pidAlive(process.pid), true);
+  assert.equal(pidAlive(-1), false);
+  assert.equal(pidAlive(0), false);
 });
