@@ -81,7 +81,7 @@ jobs:
             [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors -and $errors.Count -gt 0) {
               $failed = $true
-              Write-Host "parse errors in $f:" -ForegroundColor Red
+              Write-Host ("parse errors in {0}:" -f $f) -ForegroundColor Red
               $errors | ForEach-Object { Write-Host "  $($_.Extent.StartLineNumber): $($_.Message)" }
             } else {
               Write-Host "ok: $f"

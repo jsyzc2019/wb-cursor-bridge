@@ -89,6 +89,17 @@ async function waitFinal(base, id, timeoutMs = 15000) {
   }
 }
 
+// SSE frames carry a JSON-RPC 2.0 envelope ({jsonrpc, id, result}) per
+// A2A-02/A2A-05. The empirical checks below assert on the *event*, so unwrap
+// once here instead of at every call site. Older runtimes that emit bare
+// events still work: `result` is absent and the frame is used as-is.
+function unwrapSseFrame(frame) {
+  if (frame && typeof frame === 'object' && 'result' in frame && frame.result && typeof frame.result === 'object') {
+    return frame.result;
+  }
+  return frame;
+}
+
 async function readSse(res, timeoutMs = 15000) {
   const events = [];
   const reader = res.body.getReader();
@@ -105,7 +116,7 @@ async function readSse(res, timeoutMs = 15000) {
       buf = buf.slice(idx + 2);
       for (const line of chunk.split('\n')) {
         if (line.startsWith('data:')) {
-          try { events.push(JSON.parse(line.slice(5).trim())); } catch { /* ignore */ }
+          try { events.push(unwrapSseFrame(JSON.parse(line.slice(5).trim()))); } catch { /* ignore */ }
         }
       }
     }
