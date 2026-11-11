@@ -7,6 +7,9 @@ export type BridgeErrorCode =
   | 'E_CONCURRENCY'
   | 'E_TIMEOUT'
   | 'E_SPAWN'
+  /** Isolation could not be established; the task was refused rather than run
+   *  directly in the caller's checkout. */
+  | 'E_ISOLATION'
   | 'E_BAD_ARGUMENT'
   | 'E_INTERNAL';
 
@@ -32,5 +35,7 @@ export const concurrency = (m: string, d?: unknown) =>
   new BridgeError('E_CONCURRENCY', m, d);
 export const spawnFailed = (m: string, d?: unknown) =>
   new BridgeError('E_SPAWN', m, d);
+export const isolationFailed = (m: string, d?: unknown) =>
+  new BridgeError('E_ISOLATION', m, d);
 export const badConfig = (m: string, d?: unknown) =>
   new BridgeError('E_CONFIG', m, d);

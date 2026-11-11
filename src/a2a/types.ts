@@ -36,6 +36,8 @@ export const A2A_ERROR = {
   AUTH_REQUIRED: -32097,
   /** Request rate exceeded the A2A surface's token-bucket limit. */
   RATE_LIMITED: -32050,
+  /** The agent is at capacity; the request was not started. */
+  TASK_REJECTED: -32006,
 } as const;
 
 export interface JsonRpcRequest {

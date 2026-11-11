@@ -73,6 +73,14 @@ export async function createWorktree(
 export async function captureDiff(
   worktreePath: string,
   outFile: string,
+  /**
+   * The commit the worktree was created from. Diffing against `HEAD` looks
+   * right until the agent commits its own work: HEAD then *is* the change, the
+   * diff is empty, and the deliverables (files + patch) silently vanish while
+   * the commit ends up unreachable after the worktree is removed. Anchoring to
+   * the creation commit makes committed work visible again.
+   */
+  baseCommit = 'HEAD',
 ): Promise<{ file: string; bytes: number } | null> {
   try {
     // Stage everything first so newly created files appear in the patch.
@@ -80,7 +88,7 @@ export async function captureDiff(
     // `--binary` embeds binary blobs as base64. Without it git emits
     // "Binary files differ", which cannot be re-applied when a paused task is
     // resumed - images and other assets would silently block the restore.
-    const patch = await git(worktreePath, ['diff', '--cached', '--binary', 'HEAD'], 30_000);
+    const patch = await git(worktreePath, ['diff', '--cached', '--binary', baseCommit], 30_000);
     if (!patch.trim()) return null;
     fs.mkdirSync(path.dirname(outFile), { recursive: true });
     fs.writeFileSync(outFile, patch, 'utf8');
@@ -131,23 +139,23 @@ export async function applyPatch(
 }
 
 /** Short diffstat, useful as a cheap summary in a polling response. */
-export async function diffStat(worktreePath: string): Promise<string> {
+export async function diffStat(worktreePath: string, baseCommit = 'HEAD'): Promise<string> {
   try {
-    return (await git(worktreePath, ['diff', '--cached', '--stat', 'HEAD'], 20_000)).trim();
+    return (await git(worktreePath, ['diff', '--cached', '--stat', baseCommit], 20_000)).trim();
   } catch {
     return '';
   }
 }
 
 /** Files changed in the worktree relative to HEAD, including new ones. */
-export async function changedFiles(worktreePath: string): Promise<string[]> {
+export async function changedFiles(worktreePath: string, baseCommit = 'HEAD'): Promise<string[]> {
   try {
     // `git diff HEAD` alone omits untracked files, which is exactly what an
     // agent creates most often. Stage first so new files are visible.
     await git(worktreePath, ['add', '-A'], 30_000);
     const out = await git(
       worktreePath,
-      ['diff', '--cached', '--name-only', 'HEAD'],
+      ['diff', '--cached', '--name-only', baseCommit],
       20_000,
     );
     return out.split('\n').map((s) => s.trim()).filter(Boolean);

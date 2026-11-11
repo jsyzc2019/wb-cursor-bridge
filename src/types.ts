@@ -79,6 +79,13 @@ export interface Job {
   cursor: number;
   /** Number of events dropped from the in-memory ring, if any. */
   droppedEvents?: number;
+  /** Bytes currently retained by `events` (kept under `maxEventBytes`). */
+  eventBytes?: number;
+  /**
+   * Pid of the worker for this run. Persisted so a restart can reclaim a
+   * process the previous bridge left running (crash, SIGKILL, power loss).
+   */
+  pid?: number;
   /** Isolation actually applied to this job. */
   isolation?: Isolation;
   /** Files changed by the job, relative to the repository HEAD. */

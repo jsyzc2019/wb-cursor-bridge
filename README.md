@@ -179,9 +179,13 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 | `workspaceRoots` / `CURSOR_BRIDGE_WORKSPACE_ROOTS` | 空 | 允许的仓库根，`;` 分隔；为空则**所有任务被拒** |
 | `stateDir` / `CURSOR_BRIDGE_STATE_DIR` | `%LOCALAPPDATA%\wb-cursor-bridge` | 索引、日志、产物 |
 | `defaultTimeoutSec` / `CURSOR_BRIDGE_TIMEOUT_SEC` | `900` | 单任务墙钟上限 |
-| `maxConcurrency` / `CURSOR_BRIDGE_MAX_CONCURRENCY` | `4` | 超限快速失败 |
+| `maxConcurrency` / `CURSOR_BRIDGE_MAX_CONCURRENCY` | `4` | 同时在跑的 worker 上限，超限快速失败（`-32006`） |
+| `maxLiveJobs` / `CURSOR_BRIDGE_MAX_LIVE_JOBS` | `20` | 「活任务」上限：`running` + `input-required`。只算历史条的 `maxJobs` 拦不住暂停任务堆积 |
+| `inputRequiredTtlSec` / `CURSOR_BRIDGE_INPUT_TTL_SEC` | `86400` | `input-required` 任务的存活期，过期转 `cancelled` 并清理产物（`[60, 30d]`） |
+| `maxEventBytes` / `CURSOR_BRIDGE_MAX_EVENT_BYTES` | `4 MiB` | 单任务事件环的**字节**预算。`maxEventsPerJob` 只限条数，2000 条 × 1 MiB 仍可撑爆内存 |
+| `envPassthrough` / `CURSOR_BRIDGE_ENV_PASSTHROUGH` | 空 | 额外透传给 worker 的环境变量名（逗号分隔）。默认只传 `PATH/HOME/LANG/代理/CURSOR_*/WB_*` 等，且丢弃含 `TOKEN/SECRET/KEY/AUTH` 的名字 |
 | `adminPort` / `CURSOR_BRIDGE_ADMIN_PORT` | `0`（关闭） | 开启后提供 `/healthz` `/stats` `/jobs`（仅监听 127.0.0.1） |
-| `adminShutdownToken` / `CURSOR_BRIDGE_ADMIN_SHUTDOWN_TOKEN` | 空 | 设置后 `/admin/shutdown` 需携带 token |
+| `adminShutdownToken` / `CURSOR_BRIDGE_ADMIN_SHUTDOWN_TOKEN` | 空 | **未设置时 `/admin/shutdown` 直接禁用（503）**；设置后必须 `POST` + `X-Shutdown-Token` 头（不再接受 query token） |
 | `eventLogDir` / `CURSOR_BRIDGE_EVENT_LOG_DIR` | 空 | 设置后每个 job 的事件会异步追加到 `<dir>/<jobId>/events.jsonl` |
 | `persistEvents` / `CURSOR_BRIDGE_PERSIST_EVENTS` | `0` | 设为 `1` 时自动使用 `<stateDir>/events` |
 | `logLevel` / `CURSOR_BRIDGE_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
@@ -202,8 +206,12 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 ## 安全模型
 
 - **工作区白名单**：路径需同时通过字面与 realpath 双重校验；拒绝 `..` 越界、符号链接逃逸、NUL 字节、DOS 保留设备名、8.3 短名。
-- **进程隔离**：`execute` 永远在独立 git worktree 内执行；Windows 上用 `taskkill /T /F` 杀整棵进程树，POSIX 上杀进程组。
-- **资源上限**：超时强杀、并发上限、结果体积上限、事件环形缓冲、job LRU。
+- **进程隔离（fail closed）**：`execute` 必须在独立 git worktree 内执行；非 git 目录、worktree 创建失败、子目录越界一律**拒绝任务**，绝不降级为在调用方 checkout 里 `--force` 直写。每次尝试用唯一目录名（`jobId + 时间 + 随机`），续跑撞不上上一次的残留。
+- **参数边界**：prompt 前固定加 `--` 终止符，`model` 不许以 `-` 开头——否则 `prompt: "--force"` 会被当成 flag，把 consult 档升级成写权限。
+- **环境隔离**：worker 只继承白名单 env；宿主密钥（`*TOKEN*`/`*SECRET*`/`*KEY*`）默认不可见，需要时用 `CURSOR_BRIDGE_ENV_PASSTHROUGH` 逐个点名。
+- **HTTP 面**：`headersTimeout=10s` / `requestTimeout=60s` / `keepAliveTimeout=5s` / `maxConnections=512`；限流按来源 IP 分桶（原先单桶=一个客户端能把所有人打成 429），SSE 不受请求超时影响。
+- **进程回收**：worker pid 落盘，重启后校验 `/proc/<pid>/cmdline` 再回收上一条命遗留的 agent；pid 被复用时不会误杀。
+- **资源上限**：超时强杀、并发上限、活任务上限、暂停 TTL、结果体积上限、事件环字节上限、job LRU，淘汰时同步删除磁盘产物与事件日志。
 - **审计**：任务索引与产物原子落盘；可选开启事件 JSONL 持久化（`CURSOR_BRIDGE_PERSIST_EVENTS=1`）以满足强审计需求。崩溃后重启会把遗留 `running` 任务标记为 `orphaned`。
 - **stdout 洁癖**：任何 `console.log` 都被重定向到 stderr，避免污染 JSON-RPC 流。
 
@@ -220,9 +228,10 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 npm install
 npm run lint             # ESLint（correctness 规则；0 error 才放行）
 npm run typecheck        # tsc --noEmit
-npm test                 # 130 项：69 单元 + 5 硬化 + 20 端到端 + 3 admin HTTP + 33 A2A
+npm test                 # 140 项：单元 + 硬化 + 端到端 + admin + A2A + 审计回归（test/audit-b0）
 npm run test:stress      # 压力：高并发 / 反复 cancel-reply / hang 超时
 npm run test:fault       # 故障：磁盘/权限异常的优雅降级
+npm run test:audit       # 第三方审计 PoC 的反向回归（修复后必须绿）
 npm run test:a2a         # 仅跑 A2A 互操作（Agent Card / message/send / tasks/get / cancel / stream / push / auth / blocking / 协商 / 限流 / CORS / v1.0 / skills）
 npm run verify           # 门禁：lint + typecheck + npm test + stress + fault + release 构建
 npm run verify:e2e       # 端到端真跑实证：真实 dist 二进制 + fake-agent，54 项（v0.3.0/v1.0/鉴权/限流/CORS/产物可达/input-required 续跑/push 真投 + SSRF 拒绝/tasks/cancel 真实取消与清理/崩溃清理…）；Linux 与 Windows CI 均执行
@@ -279,7 +288,8 @@ scripts/
 | 启动即退出码 2 | 配置非法，看 `%LOCALAPPDATA%\wb-cursor-bridge\bridge.log` |
 | MCP 工具没出现 | 确认配置写在 `~/.codebuddy/.mcp.json` / `~/.cursor/mcp.json`，并重启客户端 |
 | 想看实时状态 | 设 `adminPort`，访问 `http://127.0.0.1:<port>/healthz` |
-| shutdown 端点 401 | 设置了 `adminShutdownToken`，请求需带 header `X-Shutdown-Token: <token>` 或 query `?token=<token>` |
+| shutdown 端点 503 | 未设置 `adminShutdownToken`——该端点默认禁用（fail closed）；设置后必须 `POST` 并带 header `X-Shutdown-Token: <token>` |
+| shutdown 端点 401 | 设置了 token 但请求未带/带错 header；query `?token=` 已不再接受 |
 | A2A 端点 401 | 设置了 `a2aAuthToken`，`POST /a2a`、`/healthz`、`/metrics`、`/version`、产物下载均需 `Authorization: Bearer <token>` 或 `X-A2A-Token: <token>`；Agent Card 端点无需鉴权 |
 | A2A 控制面暴露告警 | 把 `a2aHost` 设为 `0.0.0.0` 却未设 `a2aAuthToken`，启动会打印告警——控制面将对全网可达，务必同时设置 token |
 | push 通知没生效 | 开启 push 必须设置 `a2aAuthToken`；webhook 目标为私有/loopback 时需把主机加入 `a2aPushUrlAllowlist`（SSRF 防护） |

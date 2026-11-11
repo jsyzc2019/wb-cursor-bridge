@@ -1,5 +1,98 @@
 # 更新日志
 
+## 0.5.0 — 按第三方审计的 PoC 逐条修复
+
+上一版交付后收到一份外部审计，附 36 个可执行 PoC。本版把这份证据包在出货产物上
+逐脚本复跑：**26 条缺陷仍可复现**，其中 4 条能在默认配置下打挂进程。修完后再跑一遍，
+26 条全部不复现，并把它们改写成 `test/audit-b0.test.mjs` 的反向回归（修复后必须是绿的）。
+全仓测试 **130 → 140** 项。
+
+### 阻断级：进程存活
+
+- **`null` body 远程打挂**（`a2a/06`）。`JSON.parse('null')` 是合法解析，`parsed.id`
+  随即抛 TypeError；`handlePost` 是 async，`return handlePost(...)` 的 rejection 逃出了
+  同步 `try/catch`，20 个 4 字节 POST 就把进程顶到 unhandledRejection 阈值退出。
+  现在先做形状校验（非对象/数组 → `-32600`），并在调用点挂 `.catch()`。
+- **产物端点 `EISDIR` 打挂**（`a2a/10`）。`existsSync` 不是类型检查：把 patch 换成目录后
+  `createReadStream().pipe(res)` 异步抛 EISDIR，升级为 `uncaughtException`。改为
+  `statSync().isFile()` 前置 + `stream.pipeline()` 收口错误。
+- **并发槽永久泄漏**（`engine/repro-21`）。外层 Promise 只挂 `close`，而 agent 派生的
+  setsid 孙进程继承 stdout 后 `close` 永不触发——`cancel`、超时、`bridge_shutdown`
+  三条恢复路径同时失效，只能重启。现在 `exit` 是主结算信号 + 1.5s 排空窗口，
+  kill 路径 2s 硬结算，并在结算后销毁管道。
+- **事件环只按条数限制**（`engine/repro-08`）。`maxResultBytes=1 MiB` 时单任务峰值
+  RSS 仍到 490 MiB：每个 assistant 分片按原文入队，2000 条上限等于 2 GiB 上限。
+  新增 `maxEventBytes`（默认 4 MiB/任务），按字节 + 条数双预算淘汰。
+
+### 权限与隔离
+
+- **argv 注入**（`engine/repro-01`）。prompt 直接作为位置参数追加，`prompt: "--force"`
+  落进 flag 位，consult 档实际完成写入。现在 prompt 前固定 `--`，`model` 拒绝 `-` 开头。
+- **隔离 fail closed**（`engine/repro-02/03/14`）。非 git 目录、worktree 创建失败、
+  续跑撞名，原先一律降级为「让 Cursor 自己管」，结果是 `--force` 直写调用方 checkout、
+  无 patch 无回滚。现在三种情况都**拒绝任务**；子目录白名单映射到 worktree 内对应子目录；
+  每次尝试用 `jobId + 时间 + 随机` 命名。
+- **宿主 env 透传**（`engine/repro-17`）。worker 曾能读到宿主全部环境变量（`sk-live-...`
+  原样可见）。改为白名单 + 敏感名过滤，`CURSOR_BRIDGE_ENV_PASSTHROUGH` 可按名点名。
+
+### 数据与生命周期
+
+- **commit 后成果消失**（`engine/repro-10`）。agent 自行 commit 后 `git diff HEAD` 为空，
+  `changedFiles=[]`、无 patch，worktree 一删 commit 就悬空。产物捕获改为锚定
+  `baseCommit`（worktree 创建时的 HEAD），并额外记一条「worker 在 worktree 内提交」事件。
+- **report 永不导出**（`engine/repro-16`）。捕获时机早于 `finalise()`，`job.result` 还是
+  undefined；续跑则写上一轮旧答案。改为用本次 `outcome.result` 写，续跑覆盖为最终答案。
+- **孤儿 worker 无人回收**（`engine/repro-06/09`）。重启只把 job 标记 `orphaned`，
+  进程还在跑且没人知道 pid。现在 pid 随 `onSpawn` 落盘，启动时校验
+  `/proc/<pid>/cmdline` 后再回收（pid 复用不误杀）。
+- **`graceMs` 无钳制**（`engine/repro-15/18`）。`0` 会在 kill 落地前退出（agent 存活），
+  `1e999` 让等待循环永不返回、`flushNow` 不落盘。`shutdown()` 内部钳制 `[500, 60000]`，
+  `num()` 改 `Number.isFinite`。
+- **续跑绕过并发**（`engine/repro-04`）：`resumeFromInput` 现在先过与 `start()` 相同的
+  准入检查，被拒时任务保持 `input-required`。
+- **活任务无上限 / 暂停无 TTL / 产物不回收**（`engine/repro-13/20`）：新增
+  `maxLiveJobs`、`inputRequiredTtlSec`，LRU 淘汰时同步删除 artifacts 与事件日志。
+
+### A2A 互操作
+
+- **SSE 没有 JSON-RPC 信封、且从不发 `artifact-update`**（`a2a/11/13`）：帧改为
+  `{jsonrpc, id, result}`；生成器改为「产物先于终态」发送——终态是客户端消费的最后一帧，
+  排在它后面的事件必然被丢弃。
+- **通知不终止 HTTP 响应**（`a2a/06` §4）：JSON-RPC 说「不必回包」，HTTP 仍需收尾，
+  现在回 `202` 空体。
+- **`/healthz` 恒为 healthy**（`a2a/15`）：改为调用 `mgr.health()`，二进制缺失时 503。
+- **Agent Card 泄露宿主路径**（`a2a/09`）：未鉴权卡片里的 skill 描述曾含
+  `/home/alice/...`，改用 basename。
+- **push URL 的 query secret 入日志**（`a2a/02`）：拒绝分支只记 origin + path。
+- **SSRF 补 DNS 维度**（`a2a/03`）：字符串判定后解析全部 A/AAAA，任一地址落在私有段即拒；
+  发送端 `redirect: 'manual'`，不再跟随未校验的跳转。
+- **限流按来源分桶**（`a2a/07`）：单桶等于给所有人上同一把锁，一个客户端就能把其他调用方
+  打成 429；现在按 peer 地址分桶并覆盖全部动态路由（卡片除外）。
+- **容量拒绝改用 `-32006`**，不再冒充内部错误。
+
+### 交付链
+
+- **锁文件**：224 个 `resolved` 全部指向 `http://mirrors.tencent.com`（明文 HTTP），
+  而 `npm ci` 只认锁里的主机。已改写为 `https://registry.npmjs.org` 并逐个校验 integrity
+  与实际 tarball 一致；`.npmrc` 钉官方源 + `replace-registry-host=always`；
+  `npm audit --omit=dev` 由 5 条（2 high）降到 **0**。
+- **可复现构建**：`VERSION` 时间戳改用 `SOURCE_DATE_EPOCH` 或 commit time（原先每次构建
+  都不同，发布哈希无法回溯）；smoke 挪到打包**之前**；产出 `SHA256SUMS`（zip + 载荷逐文件）。
+- **安装器**：Node 运行时下载强制 https、镜像参数优先于环境变量、按 nodejs.org 的
+  `SHASUMS256.txt` 校验；解压后核对载荷 `SHA256SUMS`；`-AllowUnverifiedNode` 才能跳过。
+- **卸载器**：`SupportsShouldProcess` + 载荷特征断言 + 危险路径拒绝，`-RemovePayload`
+  不再删除「脚本所在目录」这种任意路径。
+- **CI**：最小权限 `contents: read`、`concurrency` 取消旧跑、`timeout-minutes`、
+  生产依赖审计门禁、PowerShell 语法门禁、构建可复现复核、产物上传。
+
+### 测试
+
+- 新增 `test/audit-b0.test.mjs`（10 项）：形状校验、通知 202、产物类型守卫、
+  孙进程占管道不泄漏槽位、`shutdown(Infinity)` 有限返回、事件字节预算、续跑并发、
+  `--` 终止符与 `model` 校验。
+- 新增 `fake-agent.mjs` 的 `hold-stdout` 模式，用于确定性复现「孙进程握着 stdout」。
+
+
 本项目的版本号遵循语义化版本（SemVer）：`MAJOR.MINOR.PATCH`。
 `src/version.ts` 是版本号的唯一来源，测试会断言其与 `package.json` 一致——
 版本不一致无法通过测试，因此不可能发出版本号错乱的包。

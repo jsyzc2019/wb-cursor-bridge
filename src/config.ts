@@ -24,10 +24,25 @@ export interface Config {
   forceWorktree: boolean;
   /** Hard cap on the final response string kept in memory. */
   maxResultBytes: number;
-  /** Cap on events retained in memory per job. */
+  /** Cap on events retained in memory per job (count). */
   maxEventsPerJob: number;
+  /**
+   * Cap on bytes retained by a job's event ring. `maxEventsPerJob` alone is not
+   * a memory bound: one assistant event can carry a megabyte of text, so 2000
+   * of them is gigabytes. Whichever limit is hit first evicts the oldest event.
+   */
+  maxEventBytes: number;
   /** Cap on jobs kept in memory. */
   maxJobs: number;
+  /**
+   * Cap on jobs that are still "live" (running or paused in input-required).
+   * `maxJobs` only bounds history, so paused tasks used to accumulate without
+   * limit: each one holds a worktree-less but real state entry, a patch and an
+   * event log forever.
+   */
+  maxLiveJobs: number;
+  /** How long an input-required task may sit before it is expired. */
+  inputRequiredTtlSec: number;
   logLevel: Level;
   /** Optional HTTP admin port; 0 disables it. */
   adminPort: number;
@@ -59,6 +74,13 @@ export interface Config {
   eventLogDir?: string;
   /** Extra args always appended to the Cursor invocation. */
   extraArgs: string[];
+  /**
+   * Exact environment variable names to pass through to the worker in addition
+   * to the built-in allowlist. A worker inherits a minimal environment by
+   * default: handing it the bridge's whole env leaked host secrets
+   * (`sk-live-...` was readable by any agent that printed its environment).
+   */
+  envPassthrough: string[];
 }
 
 type FileConfig = Partial<{
@@ -72,12 +94,16 @@ type FileConfig = Partial<{
   forceWorktree: boolean;
   maxResultBytes: number;
   maxEventsPerJob: number;
+  maxEventBytes: number;
   maxJobs: number;
+  maxLiveJobs: number;
+  inputRequiredTtlSec: number;
   logLevel: Level;
   adminPort: number;
   adminShutdownToken?: string;
   eventLogDir?: string;
   extraArgs: string[];
+  envPassthrough: string[];
   a2aPort?: number;
   a2aHost?: string;
   a2aAuthToken?: string;
@@ -365,13 +391,42 @@ export function loadConfig(): Config {
       50,
       100000,
     ),
+    maxEventBytes: num(
+      'CURSOR_BRIDGE_MAX_EVENT_BYTES',
+      process.env.CURSOR_BRIDGE_MAX_EVENT_BYTES,
+      file.maxEventBytes,
+      4 * 1024 * 1024,
+      64 * 1024,
+      256 * 1024 * 1024,
+    ),
     maxJobs: num('CURSOR_BRIDGE_MAX_JOBS', process.env.CURSOR_BRIDGE_MAX_JOBS, file.maxJobs, 100, 5, 10000),
+    maxLiveJobs: num(
+      'CURSOR_BRIDGE_MAX_LIVE_JOBS',
+      process.env.CURSOR_BRIDGE_MAX_LIVE_JOBS,
+      file.maxLiveJobs,
+      20,
+      1,
+      10000,
+    ),
+    inputRequiredTtlSec: num(
+      'CURSOR_BRIDGE_INPUT_TTL_SEC',
+      process.env.CURSOR_BRIDGE_INPUT_TTL_SEC,
+      file.inputRequiredTtlSec,
+      24 * 60 * 60,
+      60,
+      30 * 24 * 60 * 60,
+    ),
     logLevel,
     adminPort: num('CURSOR_BRIDGE_ADMIN_PORT', process.env.CURSOR_BRIDGE_ADMIN_PORT, file.adminPort, 0, 0, 65535),
     adminShutdownToken:
       process.env.CURSOR_BRIDGE_ADMIN_SHUTDOWN_TOKEN || file.adminShutdownToken,
     eventLogDir,
     extraArgs,
+    envPassthrough: (process.env.CURSOR_BRIDGE_ENV_PASSTHROUGH ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .concat(file.envPassthrough ?? []),
     a2aPort: num('CURSOR_BRIDGE_A2A_PORT', process.env.CURSOR_BRIDGE_A2A_PORT, file.a2aPort, 0, 0, 65535),
     a2aHost: process.env.CURSOR_BRIDGE_A2A_HOST || file.a2aHost || '127.0.0.1',
     a2aAuthToken:

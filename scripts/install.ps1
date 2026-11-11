@@ -52,7 +52,11 @@ param(
   [int]      $MaxConcurrency = 4,
   [int]      $TimeoutSec = 900,
   [string]   $NodeVersion = 'v22.11.0',
-  [string]   $NodeMirror = 'https://nodejs.org/dist',
+  [string]   $NodeMirror = '',
+  # Escape hatch for air-gapped mirrors that cannot reach nodejs.org. Skips the
+  # publisher checksum and is OFF by default: a download without verification is
+  # an install-time RCE vector, not a convenience.
+  [switch]   $AllowUnverifiedNode,
   [string]   $NodeOfflinePackage,
   [switch]   $BundleNode,
   [switch]   $SkipMcp,
@@ -85,14 +89,44 @@ function Write-Log ($m) {
 }
 
 # -------------------------------------------------------------- validation
-if (-not $IsWindows -and $PSVersionTable.PSVersion.Major -lt 6) {
-  Write-Warn 'This installer is intended for Windows PowerShell 5.1 or PowerShell 7+.'
+# $IsWindows only exists on PowerShell 6+; under Set-StrictMode a bare reference
+# throws on 5.1 (the default shell on Windows). Probe instead of assuming.
+$isWindowsHost = $true
+if (Get-Variable -Name IsWindows -ErrorAction SilentlyContinue) { $isWindowsHost = [bool]$IsWindows }
+if (-not $isWindowsHost) {
+  throw 'install.ps1 targets Windows. On other platforms run: node dist/index.js'
 }
 
 foreach ($f in @('lib\index.mjs', 'launcher.cmd')) {
   if (-not (Test-Path (Join-Path $script:Source $f))) {
     throw "Payload is incomplete: '$f' is missing. Extract the whole archive before installing."
   }
+}
+
+# Verify the extracted payload against the manifest that shipped inside the zip.
+# This catches a corrupted extraction and any post-download tampering of the
+# files we are about to place on PATH.
+$sumsFile = Join-Path $script:Source 'SHA256SUMS'
+if (Test-Path $sumsFile) {
+  Write-Step 'Verifying payload checksums'
+  $bad = @()
+  foreach ($line in Get-Content $sumsFile) {
+    if (-not $line.Trim()) { continue }
+    $parts = $line -split '\s+', 2
+    if ($parts.Count -ne 2) { continue }
+    $want = $parts[0].ToLower()
+    $rel = $parts[1].Trim()
+    $file = Join-Path $script:Source $rel
+    if (-not (Test-Path $file)) { $bad += "$rel (missing)"; continue }
+    $got = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLower()
+    if ($got -ne $want) { $bad += "$rel (hash mismatch)" }
+  }
+  if ($bad.Count -gt 0) {
+    throw ("Payload integrity check failed: " + ($bad -join '; '))
+  }
+  Write-Ok 'payload checksums verified'
+} else {
+  Write-Warn 'SHA256SUMS not present in the payload; skipping integrity check'
 }
 
 if (-not $WorkspaceRoots -or $WorkspaceRoots.Count -eq 0) {
@@ -198,8 +232,16 @@ if (-not $nodeExe) {
       Write-Ok "Node $version installed from offline package ($nodeExe)"
     } else {
       Write-Step "Downloading a private Node.js runtime ($NodeVersion)"
-      $mirror = $env:CURSOR_BRIDGE_NODE_MIRROR
-      if (-not $mirror) { $mirror = $NodeMirror }
+      # Precedence: explicit -NodeMirror beats the environment, which beats the
+      # upstream default. The old order let an inherited env var silently
+      # override what the operator typed on the command line.
+      $mirror = $NodeMirror
+      if (-not $mirror) { $mirror = $env:CURSOR_BRIDGE_NODE_MIRROR }
+      if (-not $mirror) { $mirror = 'https://nodejs.org/dist' }
+      $mirror = $mirror.TrimEnd('/')
+      if ($mirror -notmatch '^https://') {
+        throw "NodeMirror must use https:// (got '$mirror'); plaintext downloads can be replaced in transit."
+      }
       $fallback = 'https://nodejs.org/dist'
       $url = "$mirror/$version/node-$version-win-x64.zip"
       $fallbackUrl = "$fallback/$version/node-$version-win-x64.zip"
@@ -214,6 +256,25 @@ if (-not $nodeExe) {
         } else {
           throw
         }
+      }
+
+      # Verify against the runtime publisher's checksum list. The list is fetched
+      # from nodejs.org over https even when the payload came from a mirror, so a
+      # compromised mirror cannot supply a matching hash for its own payload.
+      if ($AllowUnverifiedNode) {
+        Write-Warn 'node runtime checksum verification SKIPPED (-AllowUnverifiedNode)'
+      } else {
+        $shaFile = Join-Path $env:TEMP "node-$version-SHASUMS256.txt"
+        Invoke-WebRequest -Uri "https://nodejs.org/dist/$version/SHASUMS256.txt" -OutFile $shaFile -UseBasicParsing
+        $expected = (Get-Content $shaFile | Where-Object { $_ -match " node-$version-win-x64\.zip$" } | Select-Object -First 1)
+        if (-not $expected) { throw "No checksum published for node-$version-win-x64.zip" }
+        $expectedHash = ($expected -split '\s+')[0].ToLower()
+        $actualHash = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash.ToLower()
+        if ($actualHash -ne $expectedHash) {
+          Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+          throw "Node.js runtime checksum mismatch: expected $expectedHash, got $actualHash"
+        }
+        Write-Ok "node runtime checksum verified ($actualHash)"
       }
       $extract = Join-Path $env:TEMP "node-extract-$([guid]::NewGuid().ToString('N').Substring(0,8))"
       Expand-Archive -Path $tmp -DestinationPath $extract -Force

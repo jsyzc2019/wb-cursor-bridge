@@ -13,6 +13,7 @@ import type { Readable } from 'node:stream';
 import { NdjsonReader } from '../util/ndjson.js';
 import { parseStreamLine, describeTool, type ParsedEvent } from './parse.js';
 import { killTreeGracefully } from '../util/processes.js';
+import { badArgument } from '../errors.js';
 import type { Config } from '../config.js';
 import type { JobEvent, Tier } from '../types.js';
 
@@ -20,6 +21,12 @@ export interface RunCallbacks {
   /** `seq` and `ts` are assigned by the store, not by the caller. */
   onEvent(ev: Omit<JobEvent, 'seq' | 'ts'>): void;
   onThreadId(threadId: string): void;
+  /**
+   * Called once the worker has a pid. The runner persists it so a bridge that
+   * is SIGKILLed mid-task can reclaim the still-running agent on the next boot;
+   * without this the orphan is invisible (no pid anywhere) and runs forever.
+   */
+  onSpawn?(pid: number): void;
 }
 
 export interface RunOptions {
@@ -78,6 +85,11 @@ export function buildArgs(cfg: Config, opts: RunOptions, worktreeName: string): 
   ];
   const model = opts.model ?? cfg.defaultModel;
   if (model && opts.tier !== 'consult') {
+    // A model id starting with `-` would be parsed as a flag, letting a caller
+    // smuggle `--force` (or `--mode`) past the tier policy.
+    if (model.startsWith('-')) {
+      throw badArgument(`model "${model}" must not start with "-"`);
+    }
     args.push('--model', model);
   }
   // Only ask Cursor to manage a worktree when the bridge did not make one.
@@ -88,6 +100,15 @@ export function buildArgs(cfg: Config, opts: RunOptions, worktreeName: string): 
     args.push('--resume', opts.resumeThreadId);
   }
   args.push(...cfg.extraArgs);
+  /**
+   * `--` terminates option parsing. Without it the prompt is just the next
+   * positional token, so a prompt of `--force` became a `--force` FLAG: a
+   * consult-tier job (whose whole promise is "read-only") would then run with
+   * write permission. One separator closes that class of injection for good,
+   * because everything after it is data - including anything the prompt or a
+   * caller-supplied model string contains.
+   */
+  args.push('--');
   args.push(opts.prompt);
   return args;
 }
@@ -149,6 +170,81 @@ export function resolveSpawnTarget(
   return { command: bin, args };
 }
 
+/**
+ * Environment variables a worker is allowed to inherit.
+ *
+ * The bridge used to spawn Cursor with `{...process.env}`, so every secret in
+ * the supervisor's environment - API keys, cloud credentials, CI tokens - was
+ * readable by the coding agent (and printed in any transcript that ran `env`).
+ * A worker needs very little to do its job: a PATH to find tools, a HOME for
+ * caches, locale and proxy settings. Everything else is opt-in by exact name.
+ */
+const ENV_ALLOW_EXACT = new Set([
+  'PATH',
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'SHELL',
+  'TERM',
+  'LANG',
+  'TMPDIR',
+  'TMP',
+  'TEMP',
+  // Windows
+  'SystemRoot',
+  'SystemDrive',
+  'windir',
+  'COMSPEC',
+  'PATHEXT',
+  'USERPROFILE',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'HOMEDRIVE',
+  'HOMEPATH',
+  'PROGRAMFILES',
+  'PROGRAMDATA',
+  // proxies (both cases are used in the wild)
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'ALL_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+  'all_proxy',
+]);
+
+/** Prefixes a worker may inherit (locale, bridge/agent knobs, XDG layout). */
+const ENV_ALLOW_PREFIX = ['LC_', 'XDG_', 'CURSOR_', 'WB_'];
+
+/** Anything matching this is dropped even if a prefix would have allowed it. */
+const ENV_SENSITIVE = /(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|PRIVATE_KEY|_AUTH)/i;
+
+/** Build the child environment. Exported so tests can assert it directly. */
+export function buildChildEnv(
+  cfg: Pick<Config, 'envPassthrough'>,
+  base: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const passthrough = new Set((cfg.envPassthrough ?? []).map((n) => n.trim()).filter(Boolean));
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(base)) {
+    if (value === undefined) continue;
+    const allowed =
+      passthrough.has(key) ||
+      ENV_ALLOW_EXACT.has(key) ||
+      ENV_ALLOW_PREFIX.some((p) => key.startsWith(p));
+    if (!allowed) continue;
+    // An explicit passthrough wins over the sensitive-name heuristic: the
+    // operator asked for this exact variable by name.
+    if (!passthrough.has(key) && ENV_SENSITIVE.test(key)) continue;
+    out[key] = value;
+  }
+  out.CURSOR_DISABLE_TELEMETRY = '1';
+  out.FORCE_COLOR = '0';
+  out.NO_COLOR = '1';
+  return out;
+}
+
 /** Run one Cursor invocation to completion. */
 export async function runCursor(
   cfg: Config,
@@ -172,17 +268,13 @@ export async function runCursor(
       // A new process group lets us signal the whole tree on POSIX. On Windows
       // taskkill /T does the equivalent, so a console window is never shown.
       detached: process.platform !== 'win32',
-      env: {
-        ...process.env,
-        CURSOR_DISABLE_TELEMETRY: '1',
-        FORCE_COLOR: '0',
-        NO_COLOR: '1',
-      },
+      env: buildChildEnv(cfg),
       stdio: ['ignore', 'pipe', 'pipe'],
     },
   );
 
   const pid: number | undefined = proc.pid;
+  if (pid) cb.onSpawn?.(pid);
   let result = '';
   let resultChars = 0;
   let truncated = false;
@@ -296,6 +388,51 @@ export async function runCursor(
   });
 
   let settledExitCode: number | undefined;
+  /**
+   * Resolves the promise returned to the caller, and is the ONLY place that
+   * does so. Keeping it separate from `finish()` is what fixes the permanent
+   * concurrency-slot leak: `finish()` computes the outcome, but the outer
+   * promise used to be resolved exclusively from the child's `close` event.
+   * A grandchild that inherits stdout keeps the pipe open, so `close` never
+   * fires - `cancel`, the per-job timeout and `bridge_shutdown` all waited on
+   * a promise that could never settle, and the slot was lost for good.
+   */
+  let resolveRun: ((outcome: RunOutcome) => void) | undefined;
+  let resolved = false;
+  let drainTimer: NodeJS.Timeout | undefined;
+  /**
+   * Set when WE decided the run is over (timeout / cancel). The child may then
+   * die from SIGTERM and report `code === null`, which used to be coalesced to
+   * 0 - a timed-out task was recorded as a successful completion.
+   */
+  let abortExitCode: number | undefined;
+
+  /**
+   * Settle exactly once: flush whatever is buffered, then release the pipes.
+   * Destroying the streams after `finish()` is deliberate - it lets the child's
+   * process group die even when a detached grandchild still holds the write end.
+   */
+  const finalise = (code: number): void => {
+    if (resolved) return;
+    resolved = true;
+    if (drainTimer) {
+      clearTimeout(drainTimer);
+      drainTimer = undefined;
+    }
+    void finish(code).then((outcome) => {
+      try {
+        proc.stdout?.destroy();
+      } catch {
+        /* already gone */
+      }
+      try {
+        proc.stderr?.destroy();
+      } catch {
+        /* already gone */
+      }
+      resolveRun?.(outcome);
+    });
+  };
 
   const finish = async (exitCode: number): Promise<RunOutcome> => {
     if (settled) {
@@ -348,32 +485,76 @@ export async function runCursor(
     };
   };
 
+  /**
+   * How long to wait for the last stdout bytes after `exit` before giving up on
+   * `close`. 1.5s is enough for the pipe buffer to drain on a local agent and
+   * short enough that a hijacked pipe does not turn into a hung task.
+   */
+  const DRAIN_MS = 1500;
+  /**
+   * After a kill we still give the tree a moment to produce its final words,
+   * but we never wait on `close`: that is exactly the state a detached
+   * grandchild can pin forever.
+   */
+  const KILL_SETTLE_MS = 2000;
+
+  const abortRun = (code: number, note: string): void => {
+    abortExitCode = code;
+    cb.onEvent({ type: 'note', text: note });
+    if (resolved) return;
+    /**
+     * Stay unsettled until the kill actually finished. Resolving on a fixed
+     * timer meant `bridge_shutdown` returned (and the process exited) while the
+     * SIGTERM was still in flight, so the agent outlived the bridge that had
+     * just "cancelled" it. The fallback timer only exists so a wedged kill
+     * cannot hang the task forever.
+     */
+    if (!pid) {
+      drainTimer = setTimeout(() => finalise(code), KILL_SETTLE_MS);
+      drainTimer.unref?.();
+      return;
+    }
+    const kill = logKillResult(pid);
+    const fallback = setTimeout(() => finalise(code), KILL_SETTLE_MS + 4000);
+    fallback.unref?.();
+    void kill.finally(() => {
+      clearTimeout(fallback);
+      finalise(code);
+    });
+  };
+
   let onAbort: () => void = () => {};
   const timer = setTimeout(() => {
-    cb.onEvent({ type: 'note', text: `timeout after ${opts.timeoutSec}s, killing tree` });
-    void finish(124);
-    if (pid) void logKillResult(pid);
+    abortRun(124, `timeout after ${opts.timeoutSec}s, killing tree`);
   }, opts.timeoutSec * 1000);
   timer.unref?.();
 
   if (signal) {
-    onAbort = () => {
-      cb.onEvent({ type: 'note', text: 'cancelled by caller' });
-      void finish(130);
-      if (pid) void logKillResult(pid);
-    };
+    onAbort = () => abortRun(130, 'cancelled by caller');
     if (signal.aborted) onAbort();
     else signal.addEventListener('abort', onAbort, { once: true });
   }
 
   return new Promise<RunOutcome>((resolve) => {
+    resolveRun = resolve;
     proc.on('error', (err) => {
       spawnError = err.message;
       cb.onEvent({ type: 'stderr', text: `spawn error: ${String(err)}` });
-      void finish(127).then(resolve);
+      finalise(127);
+    });
+    /**
+     * `exit` fires when the direct child is gone; `close` waits for every pipe
+     * holder. We treat `exit` as the primary signal and use `close` only to
+     * finish earlier.
+     */
+    proc.on('exit', (code, sig) => {
+      if (resolved) return;
+      const exitCode = abortExitCode ?? code ?? (sig ? 128 : 0);
+      drainTimer = setTimeout(() => finalise(exitCode), DRAIN_MS);
+      drainTimer.unref?.();
     });
     proc.on('close', (code) => {
-      void finish(code ?? 0).then(resolve);
+      finalise(abortExitCode ?? code ?? settledExitCode ?? 0);
     });
   });
 }

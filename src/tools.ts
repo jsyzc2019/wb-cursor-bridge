@@ -43,7 +43,10 @@ function num(args: Record<string, unknown>, key: string, fallback?: number): num
   const v = args[key];
   if (v === undefined || v === null) return fallback;
   const n = Number(v);
-  if (Number.isNaN(n)) throw badArgument(`argument "${key}" must be a number`);
+  // `Number.isNaN` alone lets `Infinity` / `1e999` through, and an infinite
+  // timeout or shutdown grace is indistinguishable from a hang: the wait loop
+  // never reaches its deadline. Reject anything that is not a finite number.
+  if (!Number.isFinite(n)) throw badArgument(`argument "${key}" must be a finite number`);
   return n;
 }
 

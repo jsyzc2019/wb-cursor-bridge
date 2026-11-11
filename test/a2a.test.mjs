@@ -172,7 +172,10 @@ async function readSse(response, timeoutMs = 15000) {
       buf = buf.slice(idx + 2);
       for (const line of chunk.split('\n')) {
         if (line.startsWith('data: ')) {
-          events.push(JSON.parse(line.slice(6)));
+          const frame = JSON.parse(line.slice(6));
+          // Spec-compliant frames are JSON-RPC responses; accept both shapes so
+          // the assertion below stays about behaviour, not framing.
+          events.push(frame.result ?? frame);
         }
       }
     }
@@ -858,7 +861,10 @@ test('a2a(P2#14): a JSON-RPC notification (no id) receives no response', async (
       method: 'message/send',
       params: { message: userMessage('a silent notification') },
     });
-    assert.equal(data.trim().length, 0, 'no response body for a notification');
+    // JSON-RPC: no *reply*. HTTP: the exchange still has to be terminated,
+    // otherwise the socket stays open. 202 + empty body satisfies both.
+    assert.match(data, /^HTTP\/1\.1 202/, 'notification must be acknowledged with 202');
+    assert.match(data, /\r\n\r\n\s*$/, 'and carry no body');
   } finally {
     server.close();
     await rmSafe(stateDir);

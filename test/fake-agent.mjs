@@ -28,6 +28,27 @@ if (mode === 'crash') {
   process.exit(3);
 }
 
+/**
+ * WB_FAKE_MODE=hold-stdout: leave a detached grandchild holding our stdout open,
+ * then exit. `close` never fires on the bridge side, which used to strand the
+ * concurrency slot forever (cancel / timeout / shutdown all waited on it).
+ */
+if (mode === 'hold-stdout') {
+  const { spawn } = await import('node:child_process');
+  const fs = await import('node:fs');
+  const kid = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'], {
+    stdio: ['ignore', 'inherit', 'inherit'],
+    detached: true,
+  });
+  kid.unref();
+  if (process.env.WB_HOLD_PIDFILE) {
+    fs.writeFileSync(process.env.WB_HOLD_PIDFILE, String(kid.pid));
+  }
+  out({ type: 'result', result: 'HOLD_STDOUT', thread_id: threadId });
+  await sleep(200);
+  process.exit(0);
+}
+
 if (mode === 'write') {
   // Emulate an implementation change inside the worktree.
   const fs = await import('node:fs');

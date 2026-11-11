@@ -21,6 +21,8 @@ import { currentInstanceId, pidAlive } from './util/instance.js';
 export interface StoreLimits {
   maxJobs: number;
   maxEventsPerJob: number;
+  /** Byte budget for one job's in-memory event ring. */
+  maxEventBytes: number;
 }
 
 /**
@@ -35,6 +37,24 @@ function newestFirst(a: Job, b: Job): number {
   if (a.createdAt > b.createdAt) return -1;
   if (a.createdAt < b.createdAt) return 1;
   return 0;
+}
+
+/**
+ * Rough retained size of one event. `text` and the JSON form of `detail` are
+ * what actually occupy memory; the constant covers the object and its keys.
+ * It only has to be monotonic and close enough to keep the ring honest.
+ */
+export function eventCost(ev: JobEvent): number {
+  let n = 64;
+  if (typeof ev.text === 'string') n += ev.text.length;
+  if (ev.detail !== undefined) {
+    try {
+      n += JSON.stringify(ev.detail)?.length ?? 0;
+    } catch {
+      n += 1024;
+    }
+  }
+  return n;
 }
 
 function oldestFirst(a: Job, b: Job): number {
@@ -76,6 +96,9 @@ type PersistedJob = Pick<
   | 'diffStat'
   | 'patchFile'
   | 'reportFile'
+  | 'pid'
+  | 'result'
+  | 'cursor'
 > & {
   /**
    * Instance that wrote this record.
@@ -169,8 +192,7 @@ export class JobStore {
         ...meta,
         status,
         events: [],
-        cursor: 0,
-        result: undefined,
+        cursor: meta.cursor ?? 0,
       });
     }
     // Note: `input-required` is a valid paused state (not a phantom running
@@ -210,10 +232,28 @@ export class JobStore {
     job.cursor += 1;
     const full: JobEvent = { ...ev, seq: job.cursor };
     job.events.push(full);
-    if (job.events.length > this.limits.maxEventsPerJob) {
-      const drop = job.events.length - this.limits.maxEventsPerJob;
-      job.events.splice(0, drop);
-      job.droppedEvents = (job.droppedEvents ?? 0) + drop;
+    job.eventBytes = (job.eventBytes ?? 0) + eventCost(full);
+    /**
+     * Two independent budgets. The count cap protects against a chatty worker
+     * emitting thousands of tiny events; the byte cap protects against a single
+     * worker emitting 2000 x 1 MiB - which the count cap alone happily stores
+     * (measured: ~490 MiB RSS with `maxResultBytes` set to 1 MiB). Evict oldest
+     * until BOTH are satisfied, down to 90% of the byte budget so the next
+     * append does not immediately re-trigger eviction.
+     */
+    const limits = this.limits;
+    let dropped = 0;
+    while (
+      job.events.length > 0 &&
+      (job.events.length > limits.maxEventsPerJob || (job.eventBytes ?? 0) > limits.maxEventBytes * 0.9)
+    ) {
+      const gone = job.events.shift();
+      if (!gone) break;
+      job.eventBytes = Math.max(0, (job.eventBytes ?? 0) - eventCost(gone));
+      dropped += 1;
+    }
+    if (dropped > 0) {
+      job.droppedEvents = (job.droppedEvents ?? 0) + dropped;
     }
     if (this.eventLogDir) {
       const lines = this.pendingEvents.get(job.id);
@@ -331,7 +371,7 @@ export class JobStore {
       if (!meta?.id) continue;
       const mine = this.jobs.get(meta.id);
       if (!mine) {
-        this.jobs.set(meta.id, { ...meta, events: [], cursor: 0, result: undefined });
+        this.jobs.set(meta.id, { ...meta, events: [], cursor: meta.cursor ?? 0 });
         adopted += 1;
         continue;
       }
@@ -390,6 +430,15 @@ export class JobStore {
         diffStat: j.diffStat,
         patchFile: j.patchFile,
         reportFile: j.reportFile,
+        pid: j.pid,
+        // The final answer must survive a restart: `tasks/get` on a completed
+        // task used to return a status with no result, and a polling client had
+        // no way to recover it (the events are not re-read from disk).
+        result: j.result,
+        // Persist the sequence so a client's `since` keeps working after a
+        // restart; resetting to 0 made every incremental poller silently miss
+        // every event of every later task.
+        cursor: j.cursor,
         owner: this.instanceId,
       })),
     };
@@ -438,6 +487,11 @@ export class JobStore {
   }
 
   /** Evict oldest *finished* jobs once the cap is exceeded. */
+  /** Public hook: terminal transitions can push the store over `maxJobs`. */
+  evictNow(): void {
+    this.evict();
+  }
+
   private evict(): void {
     if (this.jobs.size <= this.limits.maxJobs) return;
     const finished = [...this.jobs.values()]
@@ -446,6 +500,33 @@ export class JobStore {
     while (this.jobs.size > this.limits.maxJobs && finished.length > 0) {
       const victim = finished.shift()!;
       this.jobs.delete(victim.id);
+      /**
+       * Eviction used to be bookkeeping only: the patch directory and the
+       * JSONL event log stayed on disk forever, so a long-lived bridge grew
+       * without bound while `/metrics` reported a healthy, capped job count.
+       */
+      this.discardFiles(victim.id);
     }
+  }
+
+  /** Remove the on-disk artefacts and event log of a job. Never throws. */
+  discardFiles(id: string): void {
+    const stateDir = path.dirname(this.indexFile);
+    const targets = [path.join(stateDir, 'artifacts', id)];
+    if (this.eventLogDir) targets.push(path.join(this.eventLogDir, id));
+    for (const dir of targets) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch (err) {
+        this.log?.warn('artifact cleanup failed', { id, dir, err: String(err) });
+      }
+    }
+  }
+
+  /** Number of jobs that are still live (running or awaiting input). */
+  liveCount(): number {
+    let n = 0;
+    for (const j of this.jobs.values()) if (isLive(j.status)) n += 1;
+    return n;
   }
 }

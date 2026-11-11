@@ -6,4 +6,4 @@
  * asserting it against package.json in the test suite means a release can never
  * go out with a mismatched version.
  */
-export const VERSION = '0.4.3';
+export const VERSION = '0.5.0';

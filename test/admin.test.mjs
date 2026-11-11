@@ -138,16 +138,32 @@ test('admin: /admin/shutdown requires token when configured', async () => {
   }
 });
 
-test('admin: /admin/shutdown works without token when not configured', async () => {
+test('admin: /admin/shutdown is refused when no token is configured (fail closed)', async () => {
   const { proc, repo, stateDir } = startAdminBridge({ CURSOR_BRIDGE_ADMIN_PORT: '17903' });
   try {
     const port = await waitForPort(proc);
     const res = await httpPost(`http://127.0.0.1:${port}/admin/shutdown`);
-    assert.equal(res.status, 200);
-    await new Promise((resolve) => proc.on('close', resolve));
+    // No token configured => the endpoint is disabled, not open. A control
+    // plane reachable by any local process is not a control plane.
+    assert.equal(res.status, 503);
+    assert.match(JSON.stringify(res.body), /set CURSOR_BRIDGE_ADMIN_SHUTDOWN_TOKEN/);
+    let exited = false;
+    proc.on('close', () => {
+      exited = true;
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(exited, false, 'the bridge must keep running');
   } finally {
     proc.kill();
-    rmSync(stateDir, { recursive: true, force: true });
+    // Wait for the child to stop writing before removing its state directory.
+    await new Promise((r) => {
+      const t = setTimeout(r, 1500);
+      proc.once('close', () => {
+        clearTimeout(t);
+        r();
+      });
+    });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     rmSync(repo, { recursive: true, force: true });
   }
 });
