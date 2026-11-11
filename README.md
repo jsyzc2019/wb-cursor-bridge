@@ -228,7 +228,7 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 npm install
 npm run lint             # ESLint（correctness 规则；0 error 才放行）
 npm run typecheck        # tsc --noEmit
-npm test                 # 140 项：单元 + 硬化 + 端到端 + admin + A2A + 审计回归（test/audit-b0）
+npm test                 # 151 项：单元 + 硬化 + 端到端 + admin + A2A + 审计回归（test/audit-b0）
 npm run test:stress      # 压力：高并发 / 反复 cancel-reply / hang 超时
 npm run test:fault       # 故障：磁盘/权限异常的优雅降级
 npm run test:audit       # 第三方审计 PoC 的反向回归（修复后必须绿）
