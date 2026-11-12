@@ -14,6 +14,7 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 import { fakeBin } from './fake-bin.mjs';
+import { rmrf } from './tmp.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -133,8 +134,8 @@ test('admin: /healthz and /stats are readable without token', { timeout: 30_000 
     // Wait for the process to actually go away before unlinking: on Windows a
     // still-open handle makes rmdir EBUSY, and retries alone just spin.
     await waitClose(proc, 5000).catch(() => {});
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -162,8 +163,8 @@ test('admin: /admin/shutdown requires token when configured', { timeout: 30_000 
     // Wait for the process to actually go away before unlinking: on Windows a
     // still-open handle makes rmdir EBUSY, and retries alone just spin.
     await waitClose(proc, 5000).catch(() => {});
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -193,6 +194,6 @@ test('admin: /admin/shutdown is refused when no token is configured (fail closed
       });
     });
     rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(repo);
   }
 });

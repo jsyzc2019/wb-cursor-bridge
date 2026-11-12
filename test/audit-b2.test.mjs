@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -19,6 +19,7 @@ import { Logger } from '../dist/logger.js';
 import { startA2AServer } from '../dist/a2a/server.js';
 import { VERSION } from '../dist/version.js';
 import { fakeBin } from './fake-bin.mjs';
+import { rmrf } from './tmp.mjs';
 
 const FAKE = fakeBin('cursor');
 
@@ -87,7 +88,7 @@ async function boot(repo, over = {}) {
     close: async () => {
       await mgr.shutdown(500);
       server.close();
-      rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+      rmrf(stateDir);
     },
   };
 }
@@ -179,7 +180,7 @@ test('B2-1: SSE frames are JSON-RPC responses and carry artifact-update BEFORE t
   } finally {
     delete process.env.WB_FAKE_MODE;
     await b.close();
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(repo);
   }
 });
 
@@ -200,7 +201,7 @@ test('B2-4: the public Agent Card does not disclose absolute host paths', async 
     assert.ok(card.includes(path.basename(repo)), 'the basename is enough for a client to choose a skill');
   } finally {
     await b.close();
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(repo);
   }
 });
 
@@ -223,7 +224,7 @@ test('B2-4: /healthz reports a missing cursor binary instead of a hard-coded hea
     assert.ok(body.issues.some((i) => /cursor binary not found/i.test(i)), res.body);
   } finally {
     await b.close();
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(repo);
   }
 });
 
@@ -250,6 +251,6 @@ test('B2-7: rate limiting is per client, so one caller cannot starve the rest', 
     assert.equal(card, 200, 'discovery must not be rate limited');
   } finally {
     await b.close();
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(repo);
   }
 });

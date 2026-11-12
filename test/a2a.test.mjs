@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, writeFileSync, rmSync, chmodSync, mkdirSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, mkdirSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -24,6 +24,7 @@ import { startA2AServer } from '../dist/a2a/server.js';
 import { VERSION } from '../dist/version.js';
 
 import { fakeBin } from './fake-bin.mjs';
+import { rmrf } from './tmp.mjs';
 
 const FAKE = fakeBin('a2a');
 
@@ -129,14 +130,14 @@ function messageText(message) {
 async function rmSafe(target) {
   for (let i = 0; i < 20; i += 1) {
     try {
-      rmSync(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+      rmrf(target);
       return;
     } catch {
       await new Promise((r) => setTimeout(r, 200));
     }
   }
   try {
-    rmSync(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(target);
   } catch {
     /* give up quietly */
   }

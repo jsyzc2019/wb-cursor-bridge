@@ -7,7 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -17,6 +17,7 @@ import { buildChildEnv } from '../dist/cursor/cli.js';
 import { isAlreadyGone } from '../dist/util/processes.js';
 import { isPrivateAddress } from '../dist/util/net.js';
 import { fakeBin } from './fake-bin.mjs';
+import { rmrf } from './tmp.mjs';
 
 const FAKE = fakeBin('cursor');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -141,8 +142,8 @@ test('B1-1: an execute task on a non-git workspace is REFUSED, not run in place'
   } finally {
     delete process.env.WB_FAKE_MODE;
     await mgr.shutdown(500);
-    rmSync(plain, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(plain);
+    rmrf(stateDir);
   }
 });
 
@@ -163,8 +164,8 @@ test('B1-1: a whitelisted sub-directory runs inside the worktree copy, not the r
   } finally {
     delete process.env.WB_FAKE_MODE;
     await mgr.shutdown(500);
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(repo);
+    rmrf(stateDir);
   }
 });
 
@@ -181,7 +182,7 @@ test('B1-4: a fresh execute task exports report.md from its own result', async (
   } finally {
     delete process.env.WB_FAKE_MODE;
     await mgr.shutdown(500);
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(repo);
+    rmrf(stateDir);
   }
 });

@@ -9,14 +9,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import {
-  mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, readdirSync,
-} from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createClient, waitFor } from './client.mjs';
 import { fakeBin } from './fake-bin.mjs';
+import { rmrf } from './tmp.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FAKE = fakeBin('cursor');
@@ -64,8 +63,8 @@ test('e2e: MCP handshake exposes exactly the documented tool surface', async () 
     ]);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -94,8 +93,8 @@ test('e2e: consult job runs read-only and returns a result', async () => {
     assert.equal(poll.data.events.length, 0);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -146,8 +145,8 @@ test('e2e: execute job is isolated in a worktree and its patch is captured', asy
     );
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -165,8 +164,8 @@ test('e2e: a crashing agent is reported as failed, not swallowed', async () => {
     assert.match(done.result, /simulated crash/);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -192,8 +191,8 @@ test('e2e: cancelling a running job kills it and settles as cancelled', async ()
     assert.equal(typeof settled.data.durationMs, 'number');
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -219,8 +218,8 @@ test('e2e: concurrency limit is enforced with a clear error', async () => {
     await client.call('cursor_cancel', { jobId: first.data.jobId });
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -240,9 +239,9 @@ test('e2e: workspace outside the allowlist is refused before any process spawns'
     assert.equal(list.data.length, 0);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(outside, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
+    rmrf(outside);
   }
 });
 
@@ -268,8 +267,8 @@ test('e2e: reply resumes the same Cursor thread instead of restarting', async ()
     assert.equal(done2.status, 'completed');
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -301,8 +300,8 @@ test('e2e: input-required pauses the task and cursor_reply resumes the SAME job'
     assert.match(done.result, /FAKE_RESULT:resumed/);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -361,8 +360,8 @@ test('e2e(P0-B): a paused execute task keeps the files it already wrote', async 
     assert.equal(existsSync(path.join(repo, 'second-pass.txt')), false);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -405,8 +404,8 @@ test('e2e(P0-B): a paused task survives a bridge restart and still restores its 
     assert.ok(done.changedFiles.includes('second-pass.txt'));
   } finally {
     await second.client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -438,8 +437,8 @@ test('e2e(P0-B): an unrestorable pause fails closed instead of losing work', asy
     assert.doesNotMatch(settled.result ?? '', /RESTORED:/);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -468,8 +467,8 @@ test('e2e(P1): a flooding worker is capped in memory and still raises input-requ
     assert.equal(paused.truncated, true, 'truncation must be reported, not silent');
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -496,8 +495,8 @@ test('e2e: health and stats report the deployment accurately', async () => {
     assert.equal(stats.data.completed, 0);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -533,8 +532,8 @@ test('e2e: job state survives a bridge restart and is marked orphaned', async ()
     assert.equal(list.data.length, 1);
     c.close();
   }
-  rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-  rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  rmrf(stateDir);
+  rmrf(repo);
 });
 
 test('e2e: a missing cursor binary is reported by health, not by a crash', async () => {
@@ -556,8 +555,8 @@ test('e2e: a missing cursor binary is reported by health, not by a crash', async
     assert.match(done.result, /failed to start the Cursor CLI|ENOENT|spawn error/);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -572,8 +571,8 @@ test('e2e: cursor_list limit is clamped to a sane ceiling', async () => {
     assert.ok(list.data.length <= 1000, `expected <= 1000 jobs, got ${list.data.length}`);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -593,8 +592,8 @@ test('e2e: cursor_diff limit is clamped to a sane ceiling', async () => {
     assert.equal(typeof diff.data.patch, 'string');
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -623,8 +622,8 @@ test('e2e: optional event JSONL persistence survives the job lifecycle', async (
     assert.ok(types.includes('end'), `expected end event, got ${types.join(',')}`);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -713,7 +712,7 @@ test('e2e(P0-C): a sibling bridge on the same stateDir does not wipe a running w
   } finally {
     if (b) await b.close();
     await a.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });

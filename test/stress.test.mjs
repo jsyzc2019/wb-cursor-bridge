@@ -7,11 +7,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createClient, waitFor } from './client.mjs';
 import { fakeBin } from './fake-bin.mjs';
+import { rmrf } from './tmp.mjs';
 
 const FAKE = fakeBin('cursor');
 
@@ -75,8 +76,8 @@ test('stress: 50 ok jobs saturate maxConcurrency=20 and drain cleanly', async ()
     assert.equal(stats.data.rejected, 30);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -110,8 +111,8 @@ test('stress: 20 rounds of cancel then reply on a hanging job', async () => {
     }
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
@@ -133,7 +134,7 @@ test('stress: hanging job times out within configured window', async () => {
     assert.ok(stats.data.timedOut >= 1, 'metrics should record a timeout');
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
