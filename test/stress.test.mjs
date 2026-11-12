@@ -75,8 +75,8 @@ test('stress: 50 ok jobs saturate maxConcurrency=20 and drain cleanly', async ()
     assert.equal(stats.data.rejected, 30);
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -110,8 +110,8 @@ test('stress: 20 rounds of cancel then reply on a hanging job', async () => {
     }
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -133,7 +133,7 @@ test('stress: hanging job times out within configured window', async () => {
     assert.ok(stats.data.timedOut >= 1, 'metrics should record a timeout');
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });

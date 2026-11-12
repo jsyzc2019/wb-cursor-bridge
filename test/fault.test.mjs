@@ -57,8 +57,8 @@ test('fault: bridge survives a stateDir path occupied by a file', async () => {
     assert.equal(health.data.stateDirWritable, false);
   } finally {
     await client.close();
-    rmSync(blocked, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
+    rmSync(blocked, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -83,7 +83,7 @@ test('fault: eventLogDir occupied by a file does not break the job', async () =>
     assert.ok(existsSync(eventLogDir));
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });

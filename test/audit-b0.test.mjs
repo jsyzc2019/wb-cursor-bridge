@@ -182,8 +182,8 @@ test('B0-2: a null body is a client error, never a process-killing rejection', a
   } finally {
     await mgr.shutdown(500);
     server.close();
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -208,8 +208,8 @@ test('B0-6: a notification gets 202 and an empty body (HTTP still needs an end)'
   } finally {
     await mgr.shutdown(500);
     server.close();
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -245,8 +245,8 @@ test('B0-5: an artifact that is no longer a regular file cannot crash the bridge
     delete process.env.WB_FAKE_MODE;
     await mgr.shutdown(500);
     server.close();
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -288,8 +288,8 @@ test('ENG-21: a grandchild holding stdout cannot strand the concurrency slot', a
     delete process.env.WB_FAKE_MODE;
     delete process.env.WB_HOLD_PIDFILE;
     await mgr.shutdown(500);
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -304,8 +304,8 @@ test('B0-3: shutdown(Infinity) still returns (and flushes)', async () => {
     assert.ok(Date.now() - t0 < 3000, 'an infinite grace must not become an infinite wait');
     await mgr.shutdown(-1);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -329,8 +329,8 @@ test('B0-8: the event ring is bounded in BYTES, not just in count', async () => 
     mgr.cancel(job.id);
   } finally {
     await mgr.shutdown(500);
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -357,8 +357,8 @@ test('B0-7: resuming an input-required task respects maxConcurrency', async () =
   } finally {
     delete process.env.WB_FAKE_MODE;
     await mgr.shutdown(500);
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -389,7 +389,7 @@ test('B0-1: timeout settles the run even when the child leaves a pipe holder', a
     delete process.env.WB_FAKE_MODE;
     delete process.env.WB_HOLD_PIDFILE;
     await mgr.shutdown(500);
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });

@@ -43,8 +43,8 @@ test('assertWorkspaceAllowed: rejects paths outside every root', () => {
   try {
     assert.throws(() => assertWorkspaceAllowed(other, [root]), /outside every configured root/);
   } finally {
-    rmSync(root, { recursive: true, force: true });
-    rmSync(other, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(other, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -58,13 +58,13 @@ test('assertWorkspaceAllowed: rejects when no roots are configured', () => {
 test('assertWorkspaceAllowed: rejects a file that is not a directory', () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'wbroot-'));
   const file = path.join(root, 'a.txt');
-  rmSync(root, { recursive: true, force: true });
+  rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   mkdirSync(root, { recursive: true });
   writeFileSync(file, 'x');
   try {
     assert.throws(() => assertWorkspaceAllowed(file, [root]), /is not a directory/);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -74,7 +74,7 @@ test('assertWorkspaceAllowed: rejects NUL bytes and reserved device names', () =
     assert.throws(() => assertWorkspaceAllowed(`${root}/a\u0000b`, [root]), /NUL byte/);
     assert.throws(() => assertWorkspaceAllowed(`${root}/CON`, [root]), /reserved device name/);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -98,10 +98,10 @@ test('assertWorkspaceAllowed: a "~1"-shaped directory name is allowed, not treat
     try {
       assert.throws(() => assertWorkspaceAllowed(outside, [root]), /outside every configured root/);
     } finally {
-      rmSync(outside, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -117,8 +117,8 @@ test('assertWorkspaceAllowed: a symlink escaping the root is rejected', () => {
       /resolves to|escapes/,
     );
   } finally {
-    rmSync(root, { recursive: true, force: true });
-    rmSync(secret, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(secret, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -128,9 +128,12 @@ test('assertWorkspaceAllowed: accepts a nested directory inside a root', () => {
   mkdirSync(nested, { recursive: true });
   try {
     const resolved = assertWorkspaceAllowed(nested, [root]);
-    assert.equal(canonical(resolved), canonical(nested));
+    // The returned path is the *resolved* one: on Windows the input may be an
+    // 8.3 short name (…\RUNNER~1\…) and the job must run in the long form.
+    assert.equal(canonical(resolved), canonical(fs.realpathSync.native(nested)));
+    assert.ok(isInside(resolved, root), 'the resolved path must stay inside the root');
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -392,7 +395,7 @@ test('JobStore: marks jobs left running by a crash as orphaned', () => {
     assert.equal(s2.get('a').status, 'orphaned');
     assert.equal(s2.get('b').status, 'completed');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -418,7 +421,7 @@ test('JobStore: a sibling instance writing the index does not erase our jobs', (
     assert.deepEqual(ids, ['a1', 'a2', 'b1'], 'both histories must survive');
     assert.ok(a.get('b1'), 'the sibling job is adopted into memory too');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -438,7 +441,7 @@ test('JobStore: a sibling instance does not orphan our running job', async () =>
     assert.deepEqual(orphaned, [], 'a job owned by a live instance is not an orphan');
     assert.equal(b.get('live').status, 'running');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -458,7 +461,7 @@ test('JobStore: a job left running by our own crashed process is still orphaned'
     assert.deepEqual(orphaned, ['crashed']);
     assert.equal(restarted.get('crashed').status, 'orphaned');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -488,7 +491,7 @@ test('JobStore: a sibling completion is never rolled back to a stale state', asy
     const j1 = onDisk.jobs.find((j) => j.id === 'j1');
     assert.equal(j1.status, 'completed');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -503,7 +506,7 @@ test('JobStore: evicts oldest finished jobs over the cap, keeps running ones', (
     assert.equal(s.get('old'), undefined, 'oldest finished job is evicted');
     assert.ok(s.get('live'), 'a running job is never evicted');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -519,7 +522,7 @@ test('JobStore: event log is capped and marks truncation', () => {
     assert.equal(job.droppedEvents, 15);
     assert.equal(s.eventsSince(job, job.cursor - 3).length, 3);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -535,7 +538,7 @@ test('JobStore: index write is atomic (tmp file is renamed away)', () => {
     const parsed = JSON.parse(readFileSync(path.join(dir, 'index.json'), 'utf8'));
     assert.equal(parsed.jobs.length, 1);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -552,7 +555,7 @@ test('JobStore: a job paused in input-required survives restart without being or
     assert.equal(s2.get('a').status, 'input-required');
     assert.equal(s2.get('a').pendingInput, 'which file?');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -578,7 +581,7 @@ test('JobStore: logs repeated persist failures', () => {
     );
     assert.equal(errors[0].fields.attempt, 1);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -601,8 +604,8 @@ test('JobStore: persists events to JSONL when eventLogDir is set', async () => {
     assert.deepEqual(parsed.map((e) => e.seq), [1, 2, 3]);
     assert.equal(parsed[2].type, 'end');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
-    rmSync(eventsDir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(eventsDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -629,7 +632,7 @@ test('JobStore: event persist failure is logged without throwing', async () => {
       'event persist failure should be logged',
     );
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -704,7 +707,7 @@ test('JobManager.view: exposes A2A-style artifacts derived from deliverables', (
   assert.equal(v.artifacts.length, 2);
   assert.ok(v.artifacts.some((a) => a.name === 'changedFiles'));
   assert.ok(v.artifacts.some((a) => a.name === 'diffStat'));
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
 /* ----------------------------------------------------------------- config */
@@ -807,7 +810,7 @@ test('Logger: rotates the active file when it exceeds maxBytes', () => {
     assert.ok(stat.length <= 200, `active log should be under 200 bytes, got ${stat.length}`);
     assert.ok(existsSync(`${file}.1`) || existsSync(`${file}.2`), 'rotated file should exist');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -827,7 +830,7 @@ test('artifacts: filePart emits standard name and inlines small files', () => {
     assert.ok(part.file.bytes_inline, 'small file is base64-inlined');
     assert.equal(Buffer.from(part.file.bytes_inline, 'base64').toString(), 'hello world');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -923,7 +926,7 @@ test('instance: concurrent instances get distinct directories and neither is rec
     assert.equal(res.removed.length, 0);
     assert.equal(res.peers.length, 2);
   } finally {
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -940,7 +943,7 @@ test('instance: a directory owned by a dead pid is reclaimed', () => {
     assert.ok(!existsSync(dead), 'dead instance directory is removed');
     assert.deepEqual(res.removed, [dead]);
   } finally {
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -958,7 +961,7 @@ test('instance: a directory owned by another host is never reclaimed', () => {
     assert.ok(existsSync(dir), 'a foreign pid says nothing about liveness');
     assert.equal(res.removed.length, 0);
   } finally {
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -983,7 +986,7 @@ test('instance: unattributed legacy directories are reclaimed only once stale', 
     assert.ok(existsSync(newDir), 'a fresh unattributed directory is left alone');
     assert.deepEqual(res.unknown, [newDir]);
   } finally {
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 

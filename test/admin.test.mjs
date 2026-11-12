@@ -130,8 +130,11 @@ test('admin: /healthz and /stats are readable without token', { timeout: 30_000 
     assert.ok(Array.isArray(jobs.body));
   } finally {
     proc.kill();
-    rmSync(stateDir, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
+    // Wait for the process to actually go away before unlinking: on Windows a
+    // still-open handle makes rmdir EBUSY, and retries alone just spin.
+    await waitClose(proc, 5000).catch(() => {});
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -156,8 +159,11 @@ test('admin: /admin/shutdown requires token when configured', { timeout: 30_000 
     await waitClose(proc);
   } finally {
     proc.kill();
-    rmSync(stateDir, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
+    // Wait for the process to actually go away before unlinking: on Windows a
+    // still-open handle makes rmdir EBUSY, and retries alone just spin.
+    await waitClose(proc, 5000).catch(() => {});
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -187,6 +193,6 @@ test('admin: /admin/shutdown is refused when no token is configured (fail closed
       });
     });
     rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-    rmSync(repo, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });

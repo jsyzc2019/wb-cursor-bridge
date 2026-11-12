@@ -129,14 +129,14 @@ function messageText(message) {
 async function rmSafe(target) {
   for (let i = 0; i < 20; i += 1) {
     try {
-      rmSync(target, { recursive: true, force: true });
+      rmSync(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
       return;
     } catch {
       await new Promise((r) => setTimeout(r, 200));
     }
   }
   try {
-    rmSync(target, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   } catch {
     /* give up quietly */
   }

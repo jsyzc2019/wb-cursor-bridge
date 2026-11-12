@@ -141,8 +141,8 @@ test('B1-1: an execute task on a non-git workspace is REFUSED, not run in place'
   } finally {
     delete process.env.WB_FAKE_MODE;
     await mgr.shutdown(500);
-    rmSync(plain, { recursive: true, force: true });
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(plain, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -163,8 +163,8 @@ test('B1-1: a whitelisted sub-directory runs inside the worktree copy, not the r
   } finally {
     delete process.env.WB_FAKE_MODE;
     await mgr.shutdown(500);
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -181,7 +181,7 @@ test('B1-4: a fresh execute task exports report.md from its own result', async (
   } finally {
     delete process.env.WB_FAKE_MODE;
     await mgr.shutdown(500);
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
