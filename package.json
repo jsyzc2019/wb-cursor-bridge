@@ -1,6 +1,6 @@
 {
   "name": "wb-cursor-bridge",
-  "version": "0.4.0",
+  "version": "0.5.1",
   "description": "MCP bridge that exposes the Cursor CLI as a governed sub-agent to WorkBuddy.",
   "type": "module",
   "license": "MIT",
@@ -21,18 +21,24 @@
     "clean": "node -e \"fs.rmSync('dist',{recursive:true,force:true});fs.rmSync('release',{recursive:true,force:true})\"",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "pretest": "npm run build",
-    "test": "node --test test/unit.test.mjs test/e2e.test.mjs test/admin.test.mjs test/a2a.test.mjs",
+    "test": "node --test test/unit.test.mjs test/e2e.test.mjs test/admin.test.mjs test/a2a.test.mjs test/hardening.test.mjs test/audit-b0.test.mjs test/audit-b1.test.mjs test/audit-b2.test.mjs",
     "test:unit": "node --test test/unit.test.mjs",
     "test:e2e": "node --test test/e2e.test.mjs",
     "test:admin": "node --test test/admin.test.mjs",
     "test:a2a": "node --test test/a2a.test.mjs",
+    "test:hardening": "node --test test/hardening.test.mjs",
     "test:stress": "node --test test/stress.test.mjs",
     "test:fault": "node --test test/fault.test.mjs",
     "verify:e2e": "node scripts/e2e-empirical.mjs",
     "build:release": "npm run build && node scripts/build-release.mjs",
     "start": "node dist/index.js",
-    "verify": "npm run typecheck && npm test && npm run test:stress && npm run test:fault && npm run build:release"
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test",
+    "verify": "node scripts/verify.mjs",
+    "verify:serial": "npm run lint && npm run typecheck && npm test && npm run test:stress && npm run test:fault && npm run build:release",
+    "test:audit": "node --test test/audit-*.test.mjs"
   },
   "keywords": [
     "mcp",
@@ -49,8 +55,12 @@
     "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/node": "^22.0.0",
     "esbuild": "^0.24.2",
-    "typescript": "^5.6.0"
+    "eslint": "^9.39.5",
+    "globals": "^15.15.0",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.72.2"
   }
 }

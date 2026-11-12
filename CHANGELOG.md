@@ -1,8 +1,318 @@
 # 更新日志
 
+## 0.5.1 — 验证回路提速（无产品代码变更）
+
+外部审计交付后，日常回路是「改一版 → 跑 verify → 推 PR → 等 CI」，这一步实测太慢，
+先量后改。结论有点意外：**算力不是瓶颈**。
+
+基准用 `Math.imul` 重测（第一版用 `i * 2654435761` 写错了——`3e8 × 2.65e9 ≈ 7.9e17`
+超出 double 的 2^53 精度，V8 走慢路径，测出来「慢 3.3 倍」是假象）：
+
+| 基准 | 实测 | 参考 | 判定 |
+|---|---|---|---|
+| 吞吐型 4e8 次独立加法 | 87 ms | 200–400 ms | 比参考快 |
+| 延迟型 3e8 次串行乘法 | 330 ms | 300–900 ms | 正常 |
+| 内存 1 GiB 累加 | 182 ms | 400–700 ms | 正常 |
+| 顺序写（512 MiB） | 315 MB/s | — | 正常 |
+
+真正的成本是**固定等待**：stress 有 10.4s 停在超时窗口上（`Math.max(..., 10)` 是
+产品硬下限，不动），e2e 每条用例 ~700ms 里大半是轮询间隔，`npm test` 26.9s 里
+CPU 只占约 6s。
+
+### 改动
+
+- **轮询退避**（`test/client.mjs` 的 `pollDelay`）：固定 200ms 改为 20ms 起、
+  每次 ×1.6、200ms 封顶。任务在 400ms 内完成时，固定间隔平均多等 ~320ms；
+  退避把这一段还回来，长任务仍退化到 200ms 不空转。`waitFor` / `waitForTask` /
+  `waitStatus` / `waitFinal` / `waitFinalOrState` 统一使用。
+- **不再靠盲等证明「没有发生」**：SSRF 反向校验原先是「睡 6 秒看 webhook 有没有被
+  打」，但推送是任务状态变更时**同步**触发的，1.5s 已是 7 倍余量。两处（a2a、实证
+  脚本）从 6s/4s 降到 1.5s。
+- **等信号而不是等时间**：`audit-b0` 里等孙进程写 pidfile 的 `sleep(600)` 改为
+  轮询该文件；等并发槽被占用的 `sleep(300)` 改为等 `inflight.size`（`start()` 是
+  同步占槽的，不需要猜）。
+- **`npm run verify` 并行化**（`scripts/verify.mjs`）：先串行 build 一次（下游都读
+  `dist/`），再并行跑 7 个阶段。原串行实现 33s 里 ~27s 是等待。
+
+### 效果（4 核沙箱实测）
+
+| | 之前 | 之后 |
+|---|---|---|
+| `npm test` | 26.9s | 15.9s |
+| `npm run verify:e2e` | 11.2s | 8.4s |
+| `npm run verify` | ~33s | 18.0s |
+
+保留 `npm run verify:serial` 作为串行对照，CI 也仍可走老路径。
+
+## 0.5.0 — 按第三方审计的 PoC 逐条修复
+
+上一版交付后收到一份外部审计，附 36 个可执行 PoC。本版把这份证据包在出货产物上
+逐脚本复跑：**26 条缺陷仍可复现**，其中 4 条能在默认配置下打挂进程。修完后再跑一遍，
+26 条全部不复现，并把它们改写成 `test/audit-b0.test.mjs` 的反向回归（修复后必须是绿的）。
+全仓测试 **130 → 151** 项（其中 21 项是把 PoC 反向改写成的回归）。
+
+### 阻断级：进程存活
+
+- **`null` body 远程打挂**（`a2a/06`）。`JSON.parse('null')` 是合法解析，`parsed.id`
+  随即抛 TypeError；`handlePost` 是 async，`return handlePost(...)` 的 rejection 逃出了
+  同步 `try/catch`，20 个 4 字节 POST 就把进程顶到 unhandledRejection 阈值退出。
+  现在先做形状校验（非对象/数组 → `-32600`），并在调用点挂 `.catch()`。
+- **产物端点 `EISDIR` 打挂**（`a2a/10`）。`existsSync` 不是类型检查：把 patch 换成目录后
+  `createReadStream().pipe(res)` 异步抛 EISDIR，升级为 `uncaughtException`。改为
+  `statSync().isFile()` 前置 + `stream.pipeline()` 收口错误。
+- **并发槽永久泄漏**（`engine/repro-21`）。外层 Promise 只挂 `close`，而 agent 派生的
+  setsid 孙进程继承 stdout 后 `close` 永不触发——`cancel`、超时、`bridge_shutdown`
+  三条恢复路径同时失效，只能重启。现在 `exit` 是主结算信号 + 1.5s 排空窗口，
+  kill 路径 2s 硬结算，并在结算后销毁管道。
+- **事件环只按条数限制**（`engine/repro-08`）。`maxResultBytes=1 MiB` 时单任务峰值
+  RSS 仍到 490 MiB：每个 assistant 分片按原文入队，2000 条上限等于 2 GiB 上限。
+  新增 `maxEventBytes`（默认 4 MiB/任务），按字节 + 条数双预算淘汰。
+
+### 权限与隔离
+
+- **argv 注入**（`engine/repro-01`）。prompt 直接作为位置参数追加，`prompt: "--force"`
+  落进 flag 位，consult 档实际完成写入。现在 prompt 前固定 `--`，`model` 拒绝 `-` 开头。
+- **隔离 fail closed**（`engine/repro-02/03/14`）。非 git 目录、worktree 创建失败、
+  续跑撞名，原先一律降级为「让 Cursor 自己管」，结果是 `--force` 直写调用方 checkout、
+  无 patch 无回滚。现在三种情况都**拒绝任务**；子目录白名单映射到 worktree 内对应子目录；
+  每次尝试用 `jobId + 时间 + 随机` 命名。
+- **宿主 env 透传**（`engine/repro-17`）。worker 曾能读到宿主全部环境变量（`sk-live-...`
+  原样可见）。改为白名单 + 敏感名过滤，`CURSOR_BRIDGE_ENV_PASSTHROUGH` 可按名点名。
+- **路径白名单误杀 8.3 短名**（Windows CI 发现，审计未覆盖）。原先任何形如 `REPO~1`
+  的路径段一律拒绝；而 GitHub Windows runner 的 `%TEMP%` 正是
+  `C:\Users\RUNNER~1\AppData\Local\Temp`，于是 11 个 e2e 用例全部 `E_PATH_DENIED`。
+  短名只在同一父目录内别名，不构成穿越能力，改为**按 realpath 判定包含关系**：
+  两侧都先解析再比较，安全属性不变（junction/symlink 逃逸仍被拒），并区分
+  「指向外侧」与「解析后逃逸」两种报错以便排障。
+
+### 数据与生命周期
+
+- **commit 后成果消失**（`engine/repro-10`）。agent 自行 commit 后 `git diff HEAD` 为空，
+  `changedFiles=[]`、无 patch，worktree 一删 commit 就悬空。产物捕获改为锚定
+  `baseCommit`（worktree 创建时的 HEAD），并额外记一条「worker 在 worktree 内提交」事件。
+- **report 永不导出**（`engine/repro-16`）。捕获时机早于 `finalise()`，`job.result` 还是
+  undefined；续跑则写上一轮旧答案。改为用本次 `outcome.result` 写，续跑覆盖为最终答案。
+- **孤儿 worker 无人回收**（`engine/repro-06/09`）。重启只把 job 标记 `orphaned`，
+  进程还在跑且没人知道 pid。现在 pid 随 `onSpawn` 落盘，启动时校验
+  `/proc/<pid>/cmdline` 后再回收（pid 复用不误杀）。
+- **`graceMs` 无钳制**（`engine/repro-15/18`）。`0` 会在 kill 落地前退出（agent 存活），
+  `1e999` 让等待循环永不返回、`flushNow` 不落盘。`shutdown()` 内部钳制 `[500, 60000]`，
+  `num()` 改 `Number.isFinite`。
+- **续跑绕过并发**（`engine/repro-04`）：`resumeFromInput` 现在先过与 `start()` 相同的
+  准入检查，被拒时任务保持 `input-required`。
+- **活任务无上限 / 暂停无 TTL / 产物不回收**（`engine/repro-13/20`）：新增
+  `maxLiveJobs`、`inputRequiredTtlSec`，LRU 淘汰时同步删除 artifacts 与事件日志。
+
+### A2A 互操作
+
+- **SSE 没有 JSON-RPC 信封、且从不发 `artifact-update`**（`a2a/11/13`）：帧改为
+  `{jsonrpc, id, result}`；生成器改为「产物先于终态」发送——终态是客户端消费的最后一帧，
+  排在它后面的事件必然被丢弃。
+- **通知不终止 HTTP 响应**（`a2a/06` §4）：JSON-RPC 说「不必回包」，HTTP 仍需收尾，
+  现在回 `202` 空体。
+- **`/healthz` 恒为 healthy**（`a2a/15`）：改为调用 `mgr.health()`，二进制缺失时 503。
+- **Agent Card 泄露宿主路径**（`a2a/09`）：未鉴权卡片里的 skill 描述曾含
+  `/home/alice/...`，改用 basename。
+- **push URL 的 query secret 入日志**（`a2a/02`）：拒绝分支只记 origin + path。
+- **SSRF 补 DNS 维度**（`a2a/03`）：字符串判定后解析全部 A/AAAA，任一地址落在私有段即拒；
+  发送端 `redirect: 'manual'`，不再跟随未校验的跳转。
+- **限流按来源分桶**（`a2a/07`）：单桶等于给所有人上同一把锁，一个客户端就能把其他调用方
+  打成 429；现在按 peer 地址分桶并覆盖全部动态路由（卡片除外）。
+- **容量拒绝改用 `-32006`**，不再冒充内部错误。
+
+### 交付链
+
+- **锁文件**：224 个 `resolved` 全部指向 `http://mirrors.tencent.com`（明文 HTTP），
+  而 `npm ci` 只认锁里的主机。已改写为 `https://registry.npmjs.org` 并逐个校验 integrity
+  与实际 tarball 一致；`.npmrc` 钉官方源 + `replace-registry-host=always`；
+  `npm audit --omit=dev` 由 5 条（2 high）降到 **0**。
+- **可复现构建**：`VERSION` 时间戳改用 `SOURCE_DATE_EPOCH` 或 commit time（原先每次构建
+  都不同，发布哈希无法回溯）；smoke 挪到打包**之前**；产出 `SHA256SUMS`（zip + 载荷逐文件）。
+- **安装器**：Node 运行时下载强制 https、镜像参数优先于环境变量、按 nodejs.org 的
+  `SHASUMS256.txt` 校验；解压后核对载荷 `SHA256SUMS`；`-AllowUnverifiedNode` 才能跳过。
+- **卸载器**：`SupportsShouldProcess` + 载荷特征断言 + 危险路径拒绝，`-RemovePayload`
+  不再删除「脚本所在目录」这种任意路径。
+- **CI**：最小权限 `contents: read`、`concurrency` 取消旧跑、`timeout-minutes`、
+  生产依赖审计门禁、PowerShell 语法门禁、构建可复现复核、产物上传。
+
+### 测试
+
+- 新增 `test/audit-b0.test.mjs`（10 项）：形状校验、通知 202、产物类型守卫、
+  孙进程占管道不泄漏槽位、`shutdown(Infinity)` 有限返回、事件字节预算、续跑并发、
+  `--` 终止符与 `model` 校验。
+- 新增 `fake-agent.mjs` 的 `hold-stdout` 模式，用于确定性复现「孙进程握着 stdout」。
+
+
 本项目的版本号遵循语义化版本（SemVer）：`MAJOR.MINOR.PATCH`。
 `src/version.ts` 是版本号的唯一来源，测试会断言其与 `package.json` 一致——
 版本不一致无法通过测试，因此不可能发出版本号错乱的包。
+
+## 0.4.3 — 工程门禁：lint / 发布前校验 / Windows 全量测试
+
+全仓测试 **129 → 130** 项，`verify` 与 `prepublishOnly` 都先过 lint。这一版不改运行时
+语义（除下面那处 Windows 启动分支），补的是"能让这些问题被机器发现"的门禁。
+
+### 新增：ESLint 门禁
+
+`eslint.config.mjs` 接入 flat config，只启用偏正确性的规则（未使用绑定、松散相等、`var`、
+应 `const` 却 `let`、未定义全局），不引入会和现有代码风格打架的格式化规则。
+
+首次运行就抓到 **12 error**，其中 3 处是真问题而不是风格：
+
+- `src/a2a/watch.ts`：`lastArtifactCount` 只赋值从未读取，属死代码，删除。
+- `test/a2a.test.mjs`：`leftoverWorktrees()` 调用 `fs.readdirSync` 但从未导入 `fs`，
+  `ReferenceError` 被外层 `catch` 吞掉，**断言永远看到空数组**——见下。
+- `test/a2a.test.mjs`：0.4.2 把 worktree 改成 `<stateDir>/worktrees/<instanceId>/` 后，
+  该函数仍按旧的 `wb-` 前缀过滤，即使不抛错也永远匹配不到。
+
+### 修复：一个从 0.4.2 起就空转的 worktree 泄漏断言
+
+`a2a(P3#20): a crashed agent does not leak its git worktree` 一直在"通过"，但它检查的是
+一个恒为空的数组：`fs` 未导入 → 抛错 → `catch { return [] }`。0.4.2 改了目录层级后，
+即使导入正确，前缀过滤也只会返回空。
+
+现在按 `worktrees/<instanceId>/<worktree>` 走一层，跳过 `owner.json`。并做变异验证：
+人为在断言前创建一个残留目录，用例**如期失败**（`actual` 里出现 `probe-inst/probe-wt`），
+证明它不再是摆设。
+
+### 新增：`prepublishOnly`
+
+`npm publish` / 打包前强制 `lint + typecheck + npm test`。此前 `bin` 指向 `dist/` 而
+`dist/` 不入库，漏构建会发出一个装完就跑不起来的包。
+
+### 修复：Windows 上测试跑不起来（`.cmd` 无法无 shell 启动）
+
+Node 18.20.2+ 起，`spawn()` 一个 `.cmd`/`.bat` 且未开 `shell` 会直接 `EINVAL`
+（CVE-2024-27980）；`execFile()` 同样不行。原 CI 的做法是"临时生成 `test/fake-agent.cmd`，
+把 `CURSOR_BIN` 指过去"，因此 Windows 上只能跑 unit/e2e/admin，a2a/stress/fault 一直缺席。
+
+- 新增 `resolveSpawnTarget()`：Windows 上若 `CURSOR_BIN` 指向 `.js`/`.mjs`，改用当前
+  Node 执行该脚本；其余情况（含生产的 `agent.exe`）保持直接 spawn。
+  **不启用 shell**——prompt 是 argv，走 shell 会把 `&`、`^` 变成命令注入。
+- 测试统一经 `test/fake-bin.mjs` 取假 Agent 路径：POSIX 用 `.sh`（shebang + exec 位），
+  Windows 用 `.mjs`。
+- CI 的 Windows job 改为跑 `npm test`（含 a2a、hardening）+ `test:stress` + `test:fault`，
+  不再内联生成 shim。
+- `.gitattributes` 固定 `*.sh` 为 LF（CRLF shebang 在 POSIX 上无法执行）。
+
+### 顺带
+
+- `test/client.mjs`：把 `cond ? a() : b()` 的三元语句改成 `if/else`（lint 的
+  `no-unused-expressions`），行为不变。
+
+## 0.4.2 — 配置严格化 + CORS 凭证收敛 + 多实例共存
+
+全仓测试 **110 → 129** 项（68 单元 + 5 硬化 + 20 端到端 + 3 admin + 33 A2A），
+`verify:e2e` 54 项全过。三项都属于"不报错但结果不对"的静默故障。
+
+### 修复：非法配置值不再静默回退
+
+`num()` 把解析失败当作"用默认值"，于是 `CURSOR_BRIDGE_TIMEOUT_SEC=15m` 被静默换成
+900 秒——运维以为超时是 15 分钟，任务实际跑了 15 小时才被杀。实测六个非法值全部被接受：
+
+| 环境变量 | 修复前 | 修复后 |
+|---|---|---|
+| `CURSOR_BRIDGE_TIMEOUT_SEC=15m` | 静默用 900 | 启动失败，错误信息点名该键 |
+| `CURSOR_BRIDGE_MAX_JOBS=lots` | 静默用 100 | 启动失败 |
+| `CURSOR_BRIDGE_LOG_LEVEL=verbose` | 原样透传 | 启动失败 |
+| `CURSOR_BRIDGE_FORCE_WORKTREE=ture` | 静默按 false | 启动失败 |
+| `CURSOR_BRIDGE_A2A_PROTOCOL_VERSION=2.0` | 静默按 0.3.0 | 启动失败 |
+| 通配 CORS + 允许凭证 | 接受 | 启动失败 |
+
+- `num()`：环境变量显式给出却不可解析时抛 `badConfig`，信息含键名与示例值；配置文件
+  里的非数字同样拒绝（数字字符串仍兼容）。
+- `bool()`：只接受 `1/0`、`true/false`、`yes/no`、`on/off`。`=ture` 以前被读成
+  false，等于静默关掉了功能。
+- `logLevel`：限定 `debug|info|warn|error`。未知等级会让比较落到"全记"或"全丢"，
+  取决于比较顺序，等于把告警关掉了还不知道。
+- `a2aProtocolVersion`：限定 `0.3.0|1.0`。
+
+### 修复：CORS 通配不再授予凭证
+
+`applyCors` 命中 `*` 时反射任意 `Origin`，并无条件发送
+`access-control-allow-credentials: true`——**任何网站都能带凭证读取桥的响应**。实测
+`Origin: http://anywhere.example.com` 得到反射 origin + `allow-credentials: true`。
+
+- 新增 `CURSOR_BRIDGE_A2A_CORS_ALLOW_CREDENTIALS`（默认关闭）：只有显式开启且来源为
+  精确列表时才发送 `allow-credentials`。
+- 通配 `*` 与"允许凭证"同时出现时**拒绝启动**（该组合没有合法用途）。
+- 反射来源时补 `Vary: origin`，避免共享缓存把一个来源的响应发给另一个。
+
+### 修复：多实例共享 stateDir 互相删除 worktree
+
+MCP 客户端每个会话起一个 bridge，且都解析到同一个默认 stateDir，所以"两个实例同时
+活着"是常态而非误配。旧启动清理会**删光** `<stateDir>/worktrees` 下的所有目录：第二个
+会话启动时，第一个会话正在执行的 worktree 被删除，worker 的 `cwd` 消失，任务以无关
+错误失败。实测：兄弟实例启动后，运行中任务的 worktree 从存在变为不存在。
+
+- 新增 `src/util/instance.ts`：worktree 落在 `<stateDir>/worktrees/<instanceId>/`，
+  目录内写 `owner.json`（pid / hostname / instanceId / startedAt）。
+- 启动清理改为 `pruneStaleInstanceDirs`：只回收**同主机且 pid 已不存在**的实例目录；
+  跨主机（网络盘）一律不动；无 owner 记录的旧布局目录超过 6 小时才回收。
+- `pruneOwnedWorktrees` → `pruneWorktreeMetadata`：只跑 `git worktree prune` 清元数据，
+  **不再删除任何目录**。
+- `index.json` 增加 `owner` 字段：加载时只有"本实例"的 running 任务才算崩溃孤儿，兄弟
+  实例的存活任务保持 running（否则两边会来回把对方改成 orphaned）。
+- 写入前按 mtime+size 检测他人写入并合并：不是本进程创建的 job 以磁盘版本为准，
+  兄弟实例的 completed 不会被回滚成旧状态。
+- 检测到同主机存活兄弟实例时告警，提示可用独立 `CURSOR_BRIDGE_STATE_DIR` 隔离历史。
+
+### 测试
+
+新增 19 项（unit 16 + a2a 2 + e2e 1）：配置拒绝 7、实例目录回收语义 5（存活 / 已死 /
+跨主机 / 旧布局 / pidAlive）、store 多实例合并 4、CORS 凭证 2、兄弟实例不删运行中
+worktree 1（真实 git worktree + 假 Agent，修复前该断言为 `false`）。
+
+## 0.4.1 — 中断续跑不再丢工作 + 失败路径硬化
+
+全仓测试 **97 → 110** 项（52 单元 + 5 硬化 + 19 端到端 + 3 admin + 31 A2A），
+`verify:e2e` 54 项全过。所有条目都有先红后绿的回归用例，修复前的失败原因已实测记录。
+
+### 修复：`input-required` 暂停期丢失已完成的改动（P0，数据丢失）
+
+`execute` 档任务在 `input-required` 暂停时，托管 worktree 随该轮结束被删除，而续跑轮
+从干净的 `HEAD` 重建——**第一轮已经写好的文件全部消失**，续跑线程却以为自己还在原来的
+树上继续工作。实测：续跑轮的 worker 看不到自己上一轮创建的 `first-pass.txt`。
+
+- **`runner.ts`**：续跑前把暂停时保存的 patch 回放到新 worktree（`applyPatch`）。
+  最终 patch 仍是相对 `HEAD` 的累计 diff，跨多轮中断也成立。
+- **`util/git.ts` 新增 `applyPatch()`**：`git apply --index` → 失败时 `--3way`
+  （调用方在暂停期间提交过、基线移动的常见情形）。
+- **失败即关闭（fail closed）**：无法回放时任务退回 `input-required`，保留原问题、
+  保留 patch 文件并追加 `resume blocked: …` 事件，**绝不在残缺的树上继续跑 worker**
+  而假装成功。
+- **`captureDiff` 加 `--binary`**：此前二进制改动只会得到 `Binary files differ`，
+  无法回放，图片/资源类改动会让续跑必然失败。
+- **`store.ts`**：持久化 `patchFile` / `reportFile` / `changedFiles` / `diffStat` /
+  `isolation` / `model` / `inputRequiredAt`。此前只存内存，**桥重启后暂停任务的 patch
+  指针丢失，同样无法还原**；`input-required` 可跨天存在，重启是常态而非例外。
+
+### 修复：续跑不得静默改变权限档位
+
+`cursor_reply` 暴露 `tier` 参数，但 `input-required` 原地续跑时被静默忽略——调用方会
+误以为任务降级/升级了，实际仍按原档位运行。现在显式拒绝并说明原因，需换档请新建任务。
+
+### 修复：异常 worker 可把内存吃光（无上限缓冲）
+
+- **`util/ndjson.ts`**：`NdjsonReader` 现在有单行硬上限（默认 8 MiB）。一个永不换行（或吐出超大单行）的 worker 过去会让 `buffer` 无限增长直到进程 OOM；现在超限行被丢弃、计数并跳过至下一个换行，后续正常事件照常解析，并给出 `dropped N oversized stream line(s)` 事件而不是假装无输出。
+- **`cursor/cli.ts`**：`result` 边流边截断，`maxResultBytes` 不再只在进程退出时生效；同时保留 16 KiB 尾部窗口，**结果被截断后仍能识别最后一行 `NEED_INPUT:`**（否则话多的 worker 会"静默完成"而不是暂停提问）。
+- **`runner.ts`**：`pauseForInput` 补写 `truncated`，暂停态不再丢失"结果被截断"的事实。
+
+### 改进：blocking 调用不再为已断开的客户端空转
+
+`awaitBlockingFinal` 接 `AbortSignal`（由 `res` 的 `close` 触发）：客户端挂断后立即结束等待，**但绝不取消任务**——工作仍然被需要，调用方可以重连轮询/重订阅。
+`sendJson` 增加已销毁响应的写入保护。
+
+> 说明：实测 Node 会静默吞掉对已销毁响应的写入，因此这**不是**一个防崩修复（曾有此假设，已被用例证伪）；真实收益是每个被放弃的 blocking 请求不再空转至 `a2aBlockingMaxMs`，以及不再依赖运行时行为兜底。
+
+### 测试
+
+- `e2e(P0-B)` ×3：暂停后文件不丢（含二进制）、**桥重启后仍能续跑并还原**、
+  patch 不可回放时 fail closed 且问题与 patch 都还在。
+- `e2e(P1)`：20 万字符洪泛下结果被截断在预算内，且**截断后仍正确进入 input-required**。
+- `unit` ×3：永不换行的行被限界/计数/可恢复、超长完整行被丢弃、`end()` 不泄漏残片。
+- `a2a(P1)`：blocking 客户端断连不取消任务、服务仍可用、任务自行完成。
+- `test/fake-agent.mjs` 新增 `needinput-write` 与 `flood-needinput` 模式，把"是否丢工作""是否被截断"变成可断言的事实。
 
 ## 0.4.0 — 生产级审计收尾：v1.0 迁移路线 + 协议协商 + 限流/CORS + 资源生命周期硬化
 

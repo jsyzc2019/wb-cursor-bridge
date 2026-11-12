@@ -24,10 +24,25 @@ export interface Config {
   forceWorktree: boolean;
   /** Hard cap on the final response string kept in memory. */
   maxResultBytes: number;
-  /** Cap on events retained in memory per job. */
+  /** Cap on events retained in memory per job (count). */
   maxEventsPerJob: number;
+  /**
+   * Cap on bytes retained by a job's event ring. `maxEventsPerJob` alone is not
+   * a memory bound: one assistant event can carry a megabyte of text, so 2000
+   * of them is gigabytes. Whichever limit is hit first evicts the oldest event.
+   */
+  maxEventBytes: number;
   /** Cap on jobs kept in memory. */
   maxJobs: number;
+  /**
+   * Cap on jobs that are still "live" (running or paused in input-required).
+   * `maxJobs` only bounds history, so paused tasks used to accumulate without
+   * limit: each one holds a worktree-less but real state entry, a patch and an
+   * event log forever.
+   */
+  maxLiveJobs: number;
+  /** How long an input-required task may sit before it is expired. */
+  inputRequiredTtlSec: number;
   logLevel: Level;
   /** Optional HTTP admin port; 0 disables it. */
   adminPort: number;
@@ -47,6 +62,8 @@ export interface Config {
   a2aBlockingMaxMs?: number;
   /** Allowed CORS origins for the A2A surface (e.g. a web console). Unset = no CORS headers. */
   a2aCorsOrigins?: string[];
+  /** Emit `access-control-allow-credentials` for allowed origins. Off by default; rejected together with `*`. */
+  a2aCorsAllowCredentials: boolean;
   /** Operator-declared extra A2A skills (same-root multi-skill / subfolder pinning). */
   a2aSkills?: ExtraSkill[];
   /** A2A wire protocol version to advertise and emit ('0.3.0' default; '1.0' for the v1.0 data model). */
@@ -57,6 +74,13 @@ export interface Config {
   eventLogDir?: string;
   /** Extra args always appended to the Cursor invocation. */
   extraArgs: string[];
+  /**
+   * Exact environment variable names to pass through to the worker in addition
+   * to the built-in allowlist. A worker inherits a minimal environment by
+   * default: handing it the bridge's whole env leaked host secrets
+   * (`sk-live-...` was readable by any agent that printed its environment).
+   */
+  envPassthrough: string[];
 }
 
 type FileConfig = Partial<{
@@ -70,12 +94,16 @@ type FileConfig = Partial<{
   forceWorktree: boolean;
   maxResultBytes: number;
   maxEventsPerJob: number;
+  maxEventBytes: number;
   maxJobs: number;
+  maxLiveJobs: number;
+  inputRequiredTtlSec: number;
   logLevel: Level;
   adminPort: number;
   adminShutdownToken?: string;
   eventLogDir?: string;
   extraArgs: string[];
+  envPassthrough: string[];
   a2aPort?: number;
   a2aHost?: string;
   a2aAuthToken?: string;
@@ -83,6 +111,7 @@ type FileConfig = Partial<{
   a2aPushUrlAllowlist?: string[];
   a2aBlockingMaxMs?: number;
   a2aCorsOrigins?: string[];
+  a2aCorsAllowCredentials?: boolean;
   a2aSkills?: ExtraSkill[];
   a2aProtocolVersion?: '0.3.0' | '1.0';
   a2aRateLimitPerSec?: number;
@@ -146,8 +175,27 @@ function num(
   min: number,
   max: number,
 ): number {
-  const raw = env !== undefined && env !== '' ? Number(env) : fileValue;
-  const value = raw === undefined || Number.isNaN(raw) ? fallback : raw;
+  let value: number;
+  if (env !== undefined && env.trim() !== '') {
+    // An env var that is set but unparseable is an operator mistake, not a
+    // request for the default. Silently running with the fallback is how
+    // `CURSOR_BRIDGE_TIMEOUT_SEC=15m` turns into a 15-minute job that nobody
+    // can explain hours later: fail at startup, naming the knob.
+    value = Number(env);
+    if (!Number.isFinite(value)) {
+      throw badConfig(
+        `${name} is not a number (got "${env}")`,
+        'use a plain integer, e.g. 900',
+      );
+    }
+  } else if (fileValue !== undefined) {
+    value = Number(fileValue);
+    if (!Number.isFinite(value)) {
+      throw badConfig(`${name} must be a number (got ${JSON.stringify(fileValue)})`);
+    }
+  } else {
+    return Math.floor(fallback);
+  }
   if (value < min || value > max) {
     throw badConfig(
       `${name} must be between ${min} and ${max} (got ${value})`,
@@ -156,8 +204,20 @@ function num(
   return Math.floor(value);
 }
 
-function bool(env: string | undefined, fileValue: boolean | undefined): boolean {
-  if (env !== undefined && env !== '') return /^(1|true|yes|on)$/i.test(env);
+const TRUTHY = /^(1|true|yes|on)$/i;
+const FALSY = /^(0|false|no|off)$/i;
+
+function bool(name: string, env: string | undefined, fileValue: boolean | undefined): boolean {
+  const raw = env?.trim();
+  if (raw) {
+    if (TRUTHY.test(raw)) return true;
+    if (FALSY.test(raw)) return false;
+    // Anything else used to be read as `false`, so `=ture` or `=enable` looked
+    // accepted and silently disabled the feature.
+    throw badConfig(
+      `${name} must be one of 1/0, true/false, yes/no, on/off (got "${raw}")`,
+    );
+  }
   return fileValue ?? false;
 }
 
@@ -238,6 +298,7 @@ export function loadConfig(): Config {
     : file.extraArgs ?? [];
 
   const persistEvents = bool(
+    'CURSOR_BRIDGE_PERSIST_EVENTS',
     process.env.CURSOR_BRIDGE_PERSIST_EVENTS,
     file.eventLogDir !== undefined ? true : undefined,
   );
@@ -250,9 +311,45 @@ export function loadConfig(): Config {
     eventLogDir = path.join(stateDir, 'events');
   }
 
-  const logLevel = (process.env.CURSOR_BRIDGE_LOG_LEVEL ??
-    file.logLevel ??
-    'info') as Level;
+  const LOG_LEVELS: Level[] = ['debug', 'info', 'warn', 'error'];
+  const rawLogLevel = process.env.CURSOR_BRIDGE_LOG_LEVEL ?? file.logLevel ?? 'info';
+  if (!LOG_LEVELS.includes(rawLogLevel as Level)) {
+    // An unknown level would quietly map to "always log" or "never log"
+    // depending on the comparison, so a typo could suppress the very warnings
+    // an operator turned on.
+    throw badConfig(
+      `CURSOR_BRIDGE_LOG_LEVEL must be one of ${LOG_LEVELS.join(', ')} (got "${rawLogLevel}")`,
+    );
+  }
+  const logLevel = rawLogLevel as Level;
+
+  const rawProtocol = process.env.CURSOR_BRIDGE_A2A_PROTOCOL_VERSION ?? file.a2aProtocolVersion ?? '0.3.0';
+  if (rawProtocol !== '0.3.0' && rawProtocol !== '1.0') {
+    throw badConfig(
+      `CURSOR_BRIDGE_A2A_PROTOCOL_VERSION must be "0.3.0" or "1.0" (got "${rawProtocol}")`,
+    );
+  }
+  const a2aProtocolVersion: '0.3.0' | '1.0' = rawProtocol;
+
+  const a2aCorsOrigins = parseList(
+    'CURSOR_BRIDGE_A2A_CORS_ORIGINS',
+    process.env.CURSOR_BRIDGE_A2A_CORS_ORIGINS,
+    file.a2aCorsOrigins,
+  );
+  const a2aCorsAllowCredentials = bool(
+    'CURSOR_BRIDGE_A2A_CORS_ALLOW_CREDENTIALS',
+    process.env.CURSOR_BRIDGE_A2A_CORS_ALLOW_CREDENTIALS,
+    file.a2aCorsAllowCredentials,
+  );
+  if (a2aCorsAllowCredentials && a2aCorsOrigins?.includes('*')) {
+    // Reflecting an arbitrary origin *and* allowing credentials lets any
+    // website read authenticated bridge responses. There is no legitimate use
+    // for that pair, so refuse to boot rather than ship a wide-open CORS policy.
+    throw badConfig(
+      'CURSOR_BRIDGE_A2A_CORS_ALLOW_CREDENTIALS cannot be combined with the wildcard origin "*"',
+      'list the console origins explicitly, e.g. CURSOR_BRIDGE_A2A_CORS_ORIGINS=https://console.example.com',
+    );
+  }
 
   return {
     cursorBin:
@@ -274,6 +371,7 @@ export function loadConfig(): Config {
     defaultModel:
       process.env.CURSOR_BRIDGE_MODEL || file.defaultModel || undefined,
     forceWorktree: bool(
+      'CURSOR_BRIDGE_FORCE_WORKTREE',
       process.env.CURSOR_BRIDGE_FORCE_WORKTREE,
       file.forceWorktree,
     ),
@@ -293,13 +391,42 @@ export function loadConfig(): Config {
       50,
       100000,
     ),
+    maxEventBytes: num(
+      'CURSOR_BRIDGE_MAX_EVENT_BYTES',
+      process.env.CURSOR_BRIDGE_MAX_EVENT_BYTES,
+      file.maxEventBytes,
+      4 * 1024 * 1024,
+      64 * 1024,
+      256 * 1024 * 1024,
+    ),
     maxJobs: num('CURSOR_BRIDGE_MAX_JOBS', process.env.CURSOR_BRIDGE_MAX_JOBS, file.maxJobs, 100, 5, 10000),
+    maxLiveJobs: num(
+      'CURSOR_BRIDGE_MAX_LIVE_JOBS',
+      process.env.CURSOR_BRIDGE_MAX_LIVE_JOBS,
+      file.maxLiveJobs,
+      20,
+      1,
+      10000,
+    ),
+    inputRequiredTtlSec: num(
+      'CURSOR_BRIDGE_INPUT_TTL_SEC',
+      process.env.CURSOR_BRIDGE_INPUT_TTL_SEC,
+      file.inputRequiredTtlSec,
+      24 * 60 * 60,
+      60,
+      30 * 24 * 60 * 60,
+    ),
     logLevel,
     adminPort: num('CURSOR_BRIDGE_ADMIN_PORT', process.env.CURSOR_BRIDGE_ADMIN_PORT, file.adminPort, 0, 0, 65535),
     adminShutdownToken:
       process.env.CURSOR_BRIDGE_ADMIN_SHUTDOWN_TOKEN || file.adminShutdownToken,
     eventLogDir,
     extraArgs,
+    envPassthrough: (process.env.CURSOR_BRIDGE_ENV_PASSTHROUGH ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .concat(file.envPassthrough ?? []),
     a2aPort: num('CURSOR_BRIDGE_A2A_PORT', process.env.CURSOR_BRIDGE_A2A_PORT, file.a2aPort, 0, 0, 65535),
     a2aHost: process.env.CURSOR_BRIDGE_A2A_HOST || file.a2aHost || '127.0.0.1',
     a2aAuthToken:
@@ -319,16 +446,11 @@ export function loadConfig(): Config {
       1_000,
       600_000,
     ),
-    a2aCorsOrigins: parseList(
-      'CURSOR_BRIDGE_A2A_CORS_ORIGINS',
-      process.env.CURSOR_BRIDGE_A2A_CORS_ORIGINS,
-      file.a2aCorsOrigins,
-    ),
+    a2aCorsOrigins,
+    /** Emit `access-control-allow-credentials` for allowed origins. Off by default; forbidden with a wildcard. */
+    a2aCorsAllowCredentials,
     a2aSkills: file.a2aSkills?.map((s) => ({ ...s, root: expandPath(s.root) })),
-    a2aProtocolVersion:
-      process.env.CURSOR_BRIDGE_A2A_PROTOCOL_VERSION === '1.0' ? '1.0'
-        : file.a2aProtocolVersion === '1.0' ? '1.0'
-          : '0.3.0',
+    a2aProtocolVersion,
     a2aRateLimitPerSec: num(
       'CURSOR_BRIDGE_A2A_RATE_LIMIT_PER_SEC',
       process.env.CURSOR_BRIDGE_A2A_RATE_LIMIT_PER_SEC,

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';
-import { mkdtempSync, mkdirSync, symlinkSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,8 +11,16 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 import { NdjsonReader } from '../dist/util/ndjson.js';
 import { parseStreamLine, describeTool } from '../dist/cursor/parse.js';
 import { isInside, canonical, assertWorkspaceAllowed, splitRoots } from '../dist/util/paths.js';
-import { buildArgs, tierArgs, capText, extractNeedInput, NEED_INPUT_MARKER } from '../dist/cursor/cli.js';
+import {
+  buildArgs,
+  tierArgs,
+  capText,
+  extractNeedInput,
+  resolveSpawnTarget,
+  NEED_INPUT_MARKER,
+} from '../dist/cursor/cli.js';
 import { JobStore } from '../dist/store.js';
+import { rmrf } from './tmp.mjs';
 
 /* ------------------------------------------------------------------ paths */
 
@@ -36,8 +44,8 @@ test('assertWorkspaceAllowed: rejects paths outside every root', () => {
   try {
     assert.throws(() => assertWorkspaceAllowed(other, [root]), /outside every configured root/);
   } finally {
-    rmSync(root, { recursive: true, force: true });
-    rmSync(other, { recursive: true, force: true });
+    rmrf(root);
+    rmrf(other);
   }
 });
 
@@ -51,13 +59,13 @@ test('assertWorkspaceAllowed: rejects when no roots are configured', () => {
 test('assertWorkspaceAllowed: rejects a file that is not a directory', () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'wbroot-'));
   const file = path.join(root, 'a.txt');
-  rmSync(root, { recursive: true, force: true });
+  rmrf(root);
   mkdirSync(root, { recursive: true });
   writeFileSync(file, 'x');
   try {
     assert.throws(() => assertWorkspaceAllowed(file, [root]), /is not a directory/);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmrf(root);
   }
 });
 
@@ -67,16 +75,34 @@ test('assertWorkspaceAllowed: rejects NUL bytes and reserved device names', () =
     assert.throws(() => assertWorkspaceAllowed(`${root}/a\u0000b`, [root]), /NUL byte/);
     assert.throws(() => assertWorkspaceAllowed(`${root}/CON`, [root]), /reserved device name/);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmrf(root);
   }
 });
 
-test('assertWorkspaceAllowed: rejects 8.3 short names', () => {
+test('assertWorkspaceAllowed: a "~1"-shaped directory name is allowed, not treated as a short-name alias', () => {
+  // Regression: rejecting every component matching /~[0-9]+$/ failed *every*
+  // Windows CI e2e case, because GitHub runners expose
+  // %TEMP% = C:\Users\RUNNER~1\AppData\Local\Temp. A short name always aliases
+  // an entry in the same parent, so it grants no traversal power; the realpath
+  // gate below is what enforces containment.
   const root = mkdtempSync(path.join(os.tmpdir(), 'wbroot-'));
+  const dir = path.join(root, 'data~1');
   try {
-    assert.throws(() => assertWorkspaceAllowed(`${root}/REPO~1`, [root]), /short name/);
+    try {
+      mkdirSync(dir);
+    } catch {
+      return; // NTFS refused to create the literal name; nothing to assert here
+    }
+    assert.equal(assertWorkspaceAllowed(dir, [root]), canonical(fs.realpathSync.native(dir)));
+    // Still contained-or-nothing: the sibling outside the root stays refused.
+    const outside = mkdtempSync(path.join(os.tmpdir(), 'wboutside-'));
+    try {
+      assert.throws(() => assertWorkspaceAllowed(outside, [root]), /outside every configured root/);
+    } finally {
+      rmrf(outside);
+    }
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmrf(root);
   }
 });
 
@@ -92,8 +118,8 @@ test('assertWorkspaceAllowed: a symlink escaping the root is rejected', () => {
       /resolves to|escapes/,
     );
   } finally {
-    rmSync(root, { recursive: true, force: true });
-    rmSync(secret, { recursive: true, force: true });
+    rmrf(root);
+    rmrf(secret);
   }
 });
 
@@ -103,9 +129,17 @@ test('assertWorkspaceAllowed: accepts a nested directory inside a root', () => {
   mkdirSync(nested, { recursive: true });
   try {
     const resolved = assertWorkspaceAllowed(nested, [root]);
-    assert.equal(canonical(resolved), canonical(nested));
+    // The returned path is the *resolved* one: on Windows the input may be an
+    // 8.3 short name (…\RUNNER~1\…) and the job must run in the long form.
+    assert.equal(canonical(resolved), canonical(fs.realpathSync.native(nested)));
+    // `root` itself may be a short name on Windows, so compare against the
+    // resolved form — otherwise this asserts a string difference, not containment.
+    assert.ok(
+      isInside(resolved, fs.realpathSync.native(root)),
+      'the resolved path must stay inside the root',
+    );
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmrf(root);
   }
 });
 
@@ -116,6 +150,24 @@ test('splitRoots: splits on ; and on : only where it is safe', () => {
 
 /* ----------------------------------------------------------------- ndjson */
 
+test('cli: a JS CURSOR_BIN runs through node on Windows, never through a shell', () => {
+  const bin = 'C:\\tools\\fake-agent.mjs';
+  const args = ['-p', 'rename a & b', '--output-format', 'stream-json'];
+
+  const win = resolveSpawnTarget(bin, args, 'win32');
+  assert.equal(win.command, process.execPath, 'Windows must not exec a .mjs directly');
+  assert.deepEqual(win.args, [bin, ...args], 'the script path goes first, argv untouched');
+
+  // A real .exe (what production uses) is spawned as-is.
+  const exe = resolveSpawnTarget('C:\\tools\\agent.exe', args, 'win32');
+  assert.equal(exe.command, 'C:\\tools\\agent.exe');
+  assert.deepEqual(exe.args, args);
+
+  // POSIX keeps the direct spawn, including the shebang-based .sh shim.
+  const posix = resolveSpawnTarget('/usr/bin/agent', args, 'linux');
+  assert.deepEqual(posix, { command: '/usr/bin/agent', args });
+});
+
 test('NdjsonReader: reassembles lines split across chunks', () => {
   const r = new NdjsonReader();
   assert.deepEqual(r.push(Buffer.from('{"a":')), []);
@@ -125,6 +177,37 @@ test('NdjsonReader: reassembles lines split across chunks', () => {
 test('NdjsonReader: handles CRLF and blank lines', () => {
   const r = new NdjsonReader();
   assert.deepEqual(r.push(Buffer.from('{"a":1}\r\n\n{"b":2}\r\n')), ['{"a":1}', '{"b":2}']);
+});
+
+test('NdjsonReader: a line that never ends is bounded, counted, and recoverable', () => {
+  const r = new NdjsonReader(64);
+  // 1 KiB without a newline: cannot be a valid event, must not accumulate.
+  assert.deepEqual(r.push(Buffer.from('x'.repeat(1024))), []);
+  assert.equal(r.pending, 0, 'the oversized partial line must be dropped');
+  assert.equal(r.droppedLines, 1);
+  assert.ok(r.droppedBytes >= 1024);
+
+  // Still inside the oversized line: bytes are skipped, not buffered.
+  assert.deepEqual(r.push(Buffer.from('y'.repeat(512))), []);
+  assert.equal(r.pending, 0);
+
+  // The line finally ends; the NEXT line must parse normally.
+  assert.deepEqual(r.push(Buffer.from('tail\n{"ok":true}\n')), ['{"ok":true}']);
+  assert.equal(r.droppedLines, 1, 'one logical line is counted once');
+});
+
+test('NdjsonReader: a complete but oversized line is dropped, following lines survive', () => {
+  const r = new NdjsonReader(32);
+  const out = r.push(Buffer.from(`${'z'.repeat(100)}\n{"ok":1}\n`));
+  assert.deepEqual(out, ['{"ok":1}']);
+  assert.equal(r.droppedLines, 1);
+});
+
+test('NdjsonReader: end() never leaks the remnant of a dropped line', () => {
+  const r = new NdjsonReader(16);
+  r.push(Buffer.from('w'.repeat(64)));
+  assert.deepEqual(r.end(), [], 'the remnant must not be parsed as a line');
+  assert.equal(r.pending, 0);
 });
 
 test('NdjsonReader: survives a multi-byte character split mid-sequence', () => {
@@ -318,7 +401,103 @@ test('JobStore: marks jobs left running by a crash as orphaned', () => {
     assert.equal(s2.get('a').status, 'orphaned');
     assert.equal(s2.get('b').status, 'completed');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
+  }
+});
+
+test('JobStore: a sibling instance writing the index does not erase our jobs', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'wbstore-shared-'));
+  try {
+    const limits = { maxJobs: 10, maxEventsPerJob: 100 };
+    const a = new JobStore(dir, limits);
+    a.load();
+    a.create(mkJob('a1', 'completed'));
+
+    // Second bridge on the same stateDir (one per MCP session, same default
+    // directory): it loads, then writes its own job.
+    const b = new JobStore(dir, limits);
+    b.load();
+    b.create(mkJob('b1', 'completed'));
+
+    // A's next write used to clobber the file with only A's jobs.
+    a.create(mkJob('a2', 'completed'));
+
+    const onDisk = JSON.parse(readFileSync(path.join(dir, 'index.json'), 'utf8'));
+    const ids = onDisk.jobs.map((j) => j.id).sort();
+    assert.deepEqual(ids, ['a1', 'a2', 'b1'], 'both histories must survive');
+    assert.ok(a.get('b1'), 'the sibling job is adopted into memory too');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('JobStore: a sibling instance does not orphan our running job', async () => {
+  const { currentInstanceId } = await import('../dist/util/instance.js');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'wbstore-sibling-'));
+  try {
+    const limits = { maxJobs: 10, maxEventsPerJob: 100 };
+    const a = new JobStore(dir, limits, undefined, undefined, currentInstanceId());
+    a.load();
+    a.create(mkJob('live', 'running'));
+    a.flushNow();
+
+    // A second bridge on the same stateDir must not assume our live job crashed.
+    const b = new JobStore(dir, limits, undefined, undefined, 'another-instance');
+    const { orphaned } = b.load();
+    assert.deepEqual(orphaned, [], 'a job owned by a live instance is not an orphan');
+    assert.equal(b.get('live').status, 'running');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('JobStore: a job left running by our own crashed process is still orphaned', async () => {
+  const { currentInstanceId } = await import('../dist/util/instance.js');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'wbstore-restart-'));
+  try {
+    const limits = { maxJobs: 10, maxEventsPerJob: 100 };
+    const id = currentInstanceId();
+    const first = new JobStore(dir, limits, undefined, undefined, id);
+    first.create(mkJob('crashed', 'running'));
+    first.flushNow();
+
+    // Same instance id, fresh process state: nothing is running it any more.
+    const restarted = new JobStore(dir, limits, undefined, undefined, id);
+    const { orphaned } = restarted.load();
+    assert.deepEqual(orphaned, ['crashed']);
+    assert.equal(restarted.get('crashed').status, 'orphaned');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('JobStore: a sibling completion is never rolled back to a stale state', async () => {
+  const { currentInstanceId } = await import('../dist/util/instance.js');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'wbstore-stale-'));
+  try {
+    const limits = { maxJobs: 10, maxEventsPerJob: 100 };
+    const a = new JobStore(dir, limits, undefined, undefined, currentInstanceId());
+    a.load();
+    a.create(mkJob('j1', 'running'));
+    a.flushNow();
+
+    // B loads the running job; it belongs to a live instance, so B must not
+    // declare it orphaned.
+    const b = new JobStore(dir, limits, undefined, undefined, `${process.pid}-sibling-b`);
+    b.load();
+    assert.equal(b.get('j1').status, 'running', 'a live sibling job stays running');
+
+    // A finishes it on disk.
+    a.jobs.set('j1', mkJob('j1', 'completed'));
+    a.persist();
+
+    // B's next write must not resurrect "running" for j1.
+    b.persist();
+    const onDisk = JSON.parse(readFileSync(path.join(dir, 'index.json'), 'utf8'));
+    const j1 = onDisk.jobs.find((j) => j.id === 'j1');
+    assert.equal(j1.status, 'completed');
+  } finally {
+    rmrf(dir);
   }
 });
 
@@ -333,7 +512,7 @@ test('JobStore: evicts oldest finished jobs over the cap, keeps running ones', (
     assert.equal(s.get('old'), undefined, 'oldest finished job is evicted');
     assert.ok(s.get('live'), 'a running job is never evicted');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
   }
 });
 
@@ -349,7 +528,7 @@ test('JobStore: event log is capped and marks truncation', () => {
     assert.equal(job.droppedEvents, 15);
     assert.equal(s.eventsSince(job, job.cursor - 3).length, 3);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
   }
 });
 
@@ -365,7 +544,7 @@ test('JobStore: index write is atomic (tmp file is renamed away)', () => {
     const parsed = JSON.parse(readFileSync(path.join(dir, 'index.json'), 'utf8'));
     assert.equal(parsed.jobs.length, 1);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
   }
 });
 
@@ -382,7 +561,7 @@ test('JobStore: a job paused in input-required survives restart without being or
     assert.equal(s2.get('a').status, 'input-required');
     assert.equal(s2.get('a').pendingInput, 'which file?');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
   }
 });
 
@@ -408,7 +587,7 @@ test('JobStore: logs repeated persist failures', () => {
     );
     assert.equal(errors[0].fields.attempt, 1);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
   }
 });
 
@@ -431,8 +610,8 @@ test('JobStore: persists events to JSONL when eventLogDir is set', async () => {
     assert.deepEqual(parsed.map((e) => e.seq), [1, 2, 3]);
     assert.equal(parsed[2].type, 'end');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
-    rmSync(eventsDir, { recursive: true, force: true });
+    rmrf(dir);
+    rmrf(eventsDir);
   }
 });
 
@@ -459,7 +638,7 @@ test('JobStore: event persist failure is logged without throwing', async () => {
       'event persist failure should be logged',
     );
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
   }
 });
 
@@ -534,12 +713,83 @@ test('JobManager.view: exposes A2A-style artifacts derived from deliverables', (
   assert.equal(v.artifacts.length, 2);
   assert.ok(v.artifacts.some((a) => a.name === 'changedFiles'));
   assert.ok(v.artifacts.some((a) => a.name === 'diffStat'));
-  rmSync(dir, { recursive: true, force: true });
+  rmrf(dir);
 });
 
 /* ----------------------------------------------------------------- config */
 
 const { loadConfig } = await import('../dist/config.js');
+
+/** Run `fn` with a temporary environment, restoring every touched key. */
+function withEnv(vars, fn) {
+  const prev = new Map();
+  for (const [k, v] of Object.entries(vars)) {
+    prev.set(k, process.env[k]);
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [k, v] of prev) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test('loadConfig: a non-numeric env value fails loudly instead of silently using the default', () => {
+  // `=15m` used to parse as NaN and be swapped for the 900s default: the
+  // operator believed the timeout was 15 minutes while jobs ran for up to 15h.
+  withEnv({ CURSOR_BRIDGE_TIMEOUT_SEC: '15m' }, () => {
+    assert.throws(() => loadConfig(), /CURSOR_BRIDGE_TIMEOUT_SEC is not a number/);
+  });
+});
+
+test('loadConfig: valid numeric env values still apply', () => {
+  withEnv({ CURSOR_BRIDGE_TIMEOUT_SEC: '120' }, () => {
+    assert.equal(loadConfig().defaultTimeoutSec, 120);
+  });
+});
+
+test('loadConfig: an unknown log level is rejected rather than silently mapped', () => {
+  withEnv({ CURSOR_BRIDGE_LOG_LEVEL: 'verbose' }, () => {
+    assert.throws(() => loadConfig(), /CURSOR_BRIDGE_LOG_LEVEL/);
+  });
+});
+
+test('loadConfig: an unrecognised boolean is rejected', () => {
+  // `=ture` used to be read as false, silently disabling the feature.
+  withEnv({ CURSOR_BRIDGE_FORCE_WORKTREE: 'ture' }, () => {
+    assert.throws(() => loadConfig(), /CURSOR_BRIDGE_FORCE_WORKTREE/);
+  });
+});
+
+test('loadConfig: an unknown A2A protocol version is rejected', () => {
+  withEnv({ CURSOR_BRIDGE_A2A_PROTOCOL_VERSION: '2.0' }, () => {
+    assert.throws(() => loadConfig(), /CURSOR_BRIDGE_A2A_PROTOCOL_VERSION/);
+  });
+});
+
+test('loadConfig: wildcard CORS cannot be combined with credentials', () => {
+  withEnv(
+    { CURSOR_BRIDGE_A2A_CORS_ORIGINS: '*', CURSOR_BRIDGE_A2A_CORS_ALLOW_CREDENTIALS: 'true' },
+    () => {
+      assert.throws(() => loadConfig(), /wildcard/);
+    },
+  );
+});
+
+test('loadConfig: wildcard CORS alone loads with credentials off', () => {
+  withEnv(
+    { CURSOR_BRIDGE_A2A_CORS_ORIGINS: '*', CURSOR_BRIDGE_A2A_CORS_ALLOW_CREDENTIALS: undefined },
+    () => {
+      const cfg = loadConfig();
+      assert.deepEqual(cfg.a2aCorsOrigins, ['*']);
+      assert.equal(cfg.a2aCorsAllowCredentials, false);
+    },
+  );
+});
 
 test('loadConfig: an out-of-range value names the offending setting', () => {
   const prev = process.env.CURSOR_BRIDGE_MAX_JOBS;
@@ -566,7 +816,7 @@ test('Logger: rotates the active file when it exceeds maxBytes', () => {
     assert.ok(stat.length <= 200, `active log should be under 200 bytes, got ${stat.length}`);
     assert.ok(existsSync(`${file}.1`) || existsSync(`${file}.2`), 'rotated file should exist');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
   }
 });
 
@@ -586,7 +836,7 @@ test('artifacts: filePart emits standard name and inlines small files', () => {
     assert.ok(part.file.bytes_inline, 'small file is base64-inlined');
     assert.equal(Buffer.from(part.file.bytes_inline, 'base64').toString(), 'hello world');
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
   }
 });
 
@@ -655,4 +905,99 @@ test('compat: toV1Card moves protocolVersion into supportedInterfaces', () => {
   assert.equal(v1.supportedInterfaces[0].protocolVersion, '1.0');
   assert.deepEqual(v1.extensions, [], 'extensions array present');
   assert.equal(v1.url, 'http://h/a2a', 'other fields carried over');
+});
+
+/* --------------------------------------------------------------- instance */
+
+const {
+  claimInstanceDir,
+  pruneStaleInstanceDirs,
+  worktreeRoot,
+  OWNER_FILE,
+  pidAlive,
+} = await import('../dist/util/instance.js');
+
+test('instance: concurrent instances get distinct directories and neither is reclaimed', () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbinst-'));
+  try {
+    const a = claimInstanceDir(stateDir, `a-${process.pid}`);
+    const b = claimInstanceDir(stateDir, `b-${process.pid}`);
+    assert.notEqual(a, b, 'each instance must own its own container');
+    assert.ok(existsSync(path.join(a, OWNER_FILE)));
+    // A third bridge starting up runs the startup reclaim; it must leave both
+    // live directories alone (this is the bug: it used to delete them all).
+    const res = pruneStaleInstanceDirs(stateDir, { selfId: 'a-third-instance' });
+    assert.ok(existsSync(a), 'live instance A keeps its worktrees');
+    assert.ok(existsSync(b), 'live instance B keeps its worktrees');
+    assert.equal(res.removed.length, 0);
+    assert.equal(res.peers.length, 2);
+  } finally {
+    rmrf(stateDir);
+  }
+});
+
+test('instance: a directory owned by a dead pid is reclaimed', () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbinst-dead-'));
+  try {
+    const dead = claimInstanceDir(stateDir, 'gone');
+    mkdirSync(path.join(dead, 'wb-job-1234'), { recursive: true });
+    writeFileSync(path.join(dead, 'wb-job-1234', 'f.txt'), 'x');
+    const res = pruneStaleInstanceDirs(stateDir, {
+      selfId: 'elsewhere',
+      isAlive: () => false,
+    });
+    assert.ok(!existsSync(dead), 'dead instance directory is removed');
+    assert.deepEqual(res.removed, [dead]);
+  } finally {
+    rmrf(stateDir);
+  }
+});
+
+test('instance: a directory owned by another host is never reclaimed', () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbinst-host-'));
+  try {
+    // owner.json records this machine's hostname; ask the pruner as if we were
+    // a different host, which is the cross-machine network-share case.
+    const dir = claimInstanceDir(stateDir, 'remote');
+    const res = pruneStaleInstanceDirs(stateDir, {
+      selfId: 'me',
+      hostname: 'some-other-host',
+      isAlive: () => false,
+    });
+    assert.ok(existsSync(dir), 'a foreign pid says nothing about liveness');
+    assert.equal(res.removed.length, 0);
+  } finally {
+    rmrf(stateDir);
+  }
+});
+
+test('instance: unattributed legacy directories are reclaimed only once stale', () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbinst-legacy-'));
+  try {
+    const root = worktreeRoot(stateDir);
+    const oldDir = path.join(root, 'wb-legacy-old');
+    const newDir = path.join(root, 'wb-legacy-new');
+    for (const dir of [oldDir, newDir]) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(path.join(dir, 'leftover.txt'), 'x');
+    }
+    // Directories written before per-instance layout carry no owner record, so
+    // age is the only signal that their bridge is gone.
+    const old = new Date(Date.now() - 10 * 60 * 60 * 1000);
+    fs.utimesSync(path.join(oldDir, 'leftover.txt'), old, old);
+    fs.utimesSync(oldDir, old, old);
+
+    const res = pruneStaleInstanceDirs(stateDir, { selfId: 'me' });
+    assert.ok(!existsSync(oldDir), 'a 10h-old unattributed directory is reclaimed');
+    assert.ok(existsSync(newDir), 'a fresh unattributed directory is left alone');
+    assert.deepEqual(res.unknown, [newDir]);
+  } finally {
+    rmrf(stateDir);
+  }
+});
+
+test('instance: pidAlive distinguishes this process from an impossible pid', () => {
+  assert.equal(pidAlive(process.pid), true);
+  assert.equal(pidAlive(-1), false);
+  assert.equal(pidAlive(0), false);
 });

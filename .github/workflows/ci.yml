@@ -6,42 +6,127 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: the build only reads the repository. Without this the default
+# token is write-capable, so any dependency that runs a postinstall script
+# inherits the ability to push.
+permissions:
+  contents: read
+
+# A new push supersedes an in-flight run for the same ref: queued duplicates
+# only burn minutes and report stale results.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
       - run: npm ci
+      # Runtime dependencies only: devDependencies intentionally include
+      # tooling that is not shipped, and a dev-only advisory must not block a
+      # release while a production one must.
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+      # verify = lint + typecheck + unit/e2e/admin/a2a/hardening/audit + stress
+      #          + fault + release build
       - run: npm run verify
       - name: End-to-end real-run empirical (real dist binary + fake-agent)
         run: npm run verify:e2e
+      # The evidence-pack regressions live in test/audit-*.test.mjs and are part
+      # of `npm test`; this keeps the name visible in the job log so a future
+      # reader can tell they were not skipped.
+      - name: Audit regression suite (reproduced third-party PoCs)
+        run: npm run test:audit
+      - name: Upload release artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            release/*.zip
+            release/SHA256SUMS
+          if-no-files-found: error
 
   windows:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
       - run: npm ci
-      - run: npm run build
-      - name: Create Windows fake-agent shim
-        shell: cmd
-        run: |
-          echo @echo off > test\fake-agent.cmd
-          echo node "%%~dp0fake-agent.mjs" %%* >> test\fake-agent.cmd
-      - name: Run Node tests with fake agent
+      # Syntax-gate the PowerShell entry points before running them. A parse
+      # error in an installer is only discovered by the user whose install
+      # fails; the parser finds it in seconds, on every push.
+      - name: Parse PowerShell scripts
         shell: pwsh
         run: |
-          $env:CURSOR_BIN = "$pwd\test\fake-agent.cmd"
-          $env:CURSOR_BRIDGE_LOG_LEVEL = "error"
-          node --test test/unit.test.mjs test/e2e.test.mjs test/admin.test.mjs
+          $files = @(
+            'scripts/install.ps1',
+            'scripts/uninstall.ps1',
+            'test/mcp-config.test.ps1'
+          )
+          $failed = $false
+          foreach ($f in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors -and $errors.Count -gt 0) {
+              $failed = $true
+              Write-Host ("parse errors in {0}:" -f $f) -ForegroundColor Red
+              $errors | ForEach-Object { Write-Host "  $($_.Extent.StartLineNumber): $($_.Message)" }
+            } else {
+              Write-Host "ok: $f"
+            }
+          }
+          if ($failed) { exit 1 }
+      # The .cmd shims (test/fake-agent.cmd, test/a2a-fake-agent.cmd) are checked
+      # in: CreateProcess cannot exec a .mjs/.sh, so a generated shim was the
+      # only reason a2a/stress/fault were skipped here. They now run as-is.
+      - name: Main suite (unit + e2e + admin + a2a + hardening + audit)
+        shell: pwsh
+        # A hung child used to stall this step until the 30-minute job cap, with
+        # no failing test named. 12 minutes is ~4x the observed worst case.
+        timeout-minutes: 12
+        run: npm test
+      - name: Stress and fault suites
+        shell: pwsh
+        run: |
+          npm run test:stress
+          npm run test:fault
       - name: Run PowerShell MCP config tests
         shell: pwsh
         run: pwsh -File test/mcp-config.test.ps1
       - name: Build release package
         shell: pwsh
         run: npm run build:release
+      # Rebuild and compare: a release that is not byte-reproducible cannot be
+      # tied back to a commit, and that is the whole point of publishing a hash.
+      - name: Verify the release archive is reproducible
+        shell: pwsh
+        run: |
+          $file = Get-ChildItem release/*.zip | Select-Object -First 1
+          $first = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+          npm run build:release | Out-Null
+          $second = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+          if ($first -ne $second) {
+            Write-Host "release is not reproducible: $first != $second" -ForegroundColor Red
+            exit 1
+          }
+          Write-Host "release sha256 = $second"
+      - name: Upload release artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            release/*.zip
+            release/SHA256SUMS
+          if-no-files-found: error

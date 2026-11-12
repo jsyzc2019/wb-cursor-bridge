@@ -10,7 +10,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { buildArtifacts } from '../artifacts.js';
-import type { ArtifactPart, Job, JobEvent, Tier } from '../types.js';
+import type { ArtifactPart, Job, Tier } from '../types.js';
 import { toV1Task, type A2AVersion } from './compat.js';
 import type {
   Artifact,

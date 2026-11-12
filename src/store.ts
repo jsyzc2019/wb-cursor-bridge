@@ -16,10 +16,13 @@ import path from 'node:path';
 import type { Job, JobEvent, JobStatus } from './types.js';
 import { notFound } from './errors.js';
 import type { Logger } from './logger.js';
+import { currentInstanceId, pidAlive } from './util/instance.js';
 
 export interface StoreLimits {
   maxJobs: number;
   maxEventsPerJob: number;
+  /** Byte budget for one job's in-memory event ring. */
+  maxEventBytes: number;
 }
 
 /**
@@ -34,6 +37,24 @@ function newestFirst(a: Job, b: Job): number {
   if (a.createdAt > b.createdAt) return -1;
   if (a.createdAt < b.createdAt) return 1;
   return 0;
+}
+
+/**
+ * Rough retained size of one event. `text` and the JSON form of `detail` are
+ * what actually occupy memory; the constant covers the object and its keys.
+ * It only has to be monotonic and close enough to keep the ring honest.
+ */
+export function eventCost(ev: JobEvent): number {
+  let n = 64;
+  if (typeof ev.text === 'string') n += ev.text.length;
+  if (ev.detail !== undefined) {
+    try {
+      n += JSON.stringify(ev.detail)?.length ?? 0;
+    } catch {
+      n += 1024;
+    }
+  }
+  return n;
 }
 
 function oldestFirst(a: Job, b: Job): number {
@@ -51,29 +72,49 @@ export function isLive(s: JobStatus): boolean {
   return s === 'running' || s === 'input-required';
 }
 
+type PersistedJob = Pick<
+  Job,
+  | 'id'
+  | 'tier'
+  | 'workspace'
+  | 'prompt'
+  | 'status'
+  | 'createdAt'
+  | 'finishedAt'
+  | 'threadId'
+  | 'contextId'
+  | 'metadata'
+  | 'parentJobId'
+  | 'exitCode'
+  | 'durationMs'
+  | 'truncated'
+  | 'pendingInput'
+  | 'inputRequiredAt'
+  | 'model'
+  | 'isolation'
+  | 'changedFiles'
+  | 'diffStat'
+  | 'patchFile'
+  | 'reportFile'
+  | 'pid'
+  | 'result'
+  | 'cursor'
+> & {
+  /**
+   * Instance that wrote this record.
+   *
+   * Two bridges can share one state directory (MCP clients spawn one bridge per
+   * session and they all resolve the same default). Without this, each one saw
+   * the other's `running` job, assumed it had crashed, and marked it orphaned -
+   * a state that then flip-flopped every time either side persisted.
+   */
+  owner?: string;
+};
+
 interface PersistedIndex {
   version: 1;
   updatedAt: string;
-  jobs: Array<
-    Pick<
-      Job,
-      | 'id'
-      | 'tier'
-      | 'workspace'
-      | 'prompt'
-      | 'status'
-      | 'createdAt'
-      | 'finishedAt'
-      | 'threadId'
-      | 'contextId'
-      | 'metadata'
-      | 'parentJobId'
-      | 'exitCode'
-      | 'durationMs'
-      | 'truncated'
-      | 'pendingInput'
-    >
-  >;
+  jobs: PersistedJob[];
 }
 
 export class JobStore {
@@ -85,6 +126,12 @@ export class JobStore {
   private log?: Logger;
   private persistFailures = 0;
   private eventLogDir?: string;
+  /** Identity of the index file as of our last read/write, to detect a sibling instance. */
+  private lastSnapshot = '';
+  /** Id of the bridge process this store belongs to. */
+  private instanceId: string;
+  /** Jobs created here: our in-memory copy is authoritative for these. */
+  private owned = new Set<string>();
   /** Buffered JSONL lines waiting for the next async flush. */
   private pendingEvents = new Map<string, string[]>();
   /** In-flight flush promises, so flushNow() can await durability. */
@@ -96,11 +143,13 @@ export class JobStore {
     limits: StoreLimits,
     log?: Logger,
     eventLogDir?: string,
+    instanceId: string = currentInstanceId(),
   ) {
     this.limits = limits;
     this.indexFile = path.join(stateDir, 'index.json');
     this.log = log;
     this.eventLogDir = eventLogDir;
+    this.instanceId = instanceId;
     try {
       fs.mkdirSync(stateDir, { recursive: true });
     } catch (err) {
@@ -119,19 +168,31 @@ export class JobStore {
     try {
       parsed = JSON.parse(fs.readFileSync(this.indexFile, 'utf8')) as PersistedIndex;
     } catch {
+      // Remember the (missing) file's identity so the first persist does not
+      // treat its own write as a foreign one.
+      this.lastSnapshot = this.snapshotKey();
       return { orphaned: [] };
     }
+    this.lastSnapshot = this.snapshotKey();
     const orphaned: string[] = [];
     for (const meta of parsed.jobs ?? []) {
-      const status: JobStatus =
-        meta.status === 'running' ? 'orphaned' : meta.status;
-      if (meta.status === 'running') orphaned.push(meta.id);
+      let status: JobStatus = meta.status;
+      if (meta.status === 'running') {
+        if (this.ownerStillAlive(meta.owner)) {
+          // A sibling bridge on this host is running it right now. Marking it
+          // orphaned would make the two instances rewrite each other's status
+          // on every persist.
+          status = 'running';
+        } else {
+          status = 'orphaned';
+          orphaned.push(meta.id);
+        }
+      }
       this.jobs.set(meta.id, {
         ...meta,
         status,
         events: [],
-        cursor: 0,
-        result: undefined,
+        cursor: meta.cursor ?? 0,
       });
     }
     // Note: `input-required` is a valid paused state (not a phantom running
@@ -142,6 +203,7 @@ export class JobStore {
 
   create(job: Job): Job {
     this.jobs.set(job.id, job);
+    this.owned.add(job.id);
     this.evict();
     // Persist immediately: if the process is hard-killed seconds from now, the
     // job must still be discoverable on the next boot and marked orphaned.
@@ -170,10 +232,28 @@ export class JobStore {
     job.cursor += 1;
     const full: JobEvent = { ...ev, seq: job.cursor };
     job.events.push(full);
-    if (job.events.length > this.limits.maxEventsPerJob) {
-      const drop = job.events.length - this.limits.maxEventsPerJob;
-      job.events.splice(0, drop);
-      job.droppedEvents = (job.droppedEvents ?? 0) + drop;
+    job.eventBytes = (job.eventBytes ?? 0) + eventCost(full);
+    /**
+     * Two independent budgets. The count cap protects against a chatty worker
+     * emitting thousands of tiny events; the byte cap protects against a single
+     * worker emitting 2000 x 1 MiB - which the count cap alone happily stores
+     * (measured: ~490 MiB RSS with `maxResultBytes` set to 1 MiB). Evict oldest
+     * until BOTH are satisfied, down to 90% of the byte budget so the next
+     * append does not immediately re-trigger eviction.
+     */
+    const limits = this.limits;
+    let dropped = 0;
+    while (
+      job.events.length > 0 &&
+      (job.events.length > limits.maxEventsPerJob || (job.eventBytes ?? 0) > limits.maxEventBytes * 0.9)
+    ) {
+      const gone = job.events.shift();
+      if (!gone) break;
+      job.eventBytes = Math.max(0, (job.eventBytes ?? 0) - eventCost(gone));
+      dropped += 1;
+    }
+    if (dropped > 0) {
+      job.droppedEvents = (job.droppedEvents ?? 0) + dropped;
     }
     if (this.eventLogDir) {
       const lines = this.pendingEvents.get(job.id);
@@ -241,7 +321,85 @@ export class JobStore {
     this.flushTimer.unref?.();
   }
 
+  /**
+   * True when a `running` record belongs to another bridge on this host whose
+   * process is still alive.
+   *
+   * Our own records are never "foreign": a fresh process cannot hold a job it
+   * has not re-created, so a running record bearing our id is a genuine crash
+   * leftover and must be orphaned.
+   */
+  private ownerStillAlive(owner: string | undefined): boolean {
+    if (!owner || owner === this.instanceId) return false;
+    const pid = Number.parseInt(owner.split('-')[0] ?? '', 10);
+    return Number.isInteger(pid) && pid > 0 && pidAlive(pid);
+  }
+
+  /** Cheap identity for the index file; mtime alone is too coarse on some filesystems. */
+  private snapshotKey(): string {
+    try {
+      const st = fs.statSync(this.indexFile);
+      return `${st.mtimeMs}:${st.size}`;
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Adopt jobs written by a sibling bridge that shares this state directory.
+   *
+   * Every MCP session spawns its own bridge and they all resolve the same
+   * default state directory, so two live instances are normal. Each keeps the
+   * index in memory and writes it back wholesale, which meant the second writer
+   * erased the first one's history. Re-reading before writing makes the two
+   * histories converge instead of clobbering each other.
+   */
+  private absorbForeignWrites(): void {
+    const key = this.snapshotKey();
+    if (key === this.lastSnapshot) return; // unchanged since our last read/write
+    this.lastSnapshot = key;
+    if (key === '') return;
+    let parsed: PersistedIndex;
+    try {
+      parsed = JSON.parse(fs.readFileSync(this.indexFile, 'utf8')) as PersistedIndex;
+    } catch {
+      return; // unreadable: keep ours rather than throwing the write away
+    }
+    let adopted = 0;
+    let refreshed = 0;
+    for (const meta of parsed.jobs ?? []) {
+      if (!meta?.id) continue;
+      const mine = this.jobs.get(meta.id);
+      if (!mine) {
+        this.jobs.set(meta.id, { ...meta, events: [], cursor: meta.cursor ?? 0 });
+        adopted += 1;
+        continue;
+      }
+      // We are authoritative only for jobs we created in *this* process. For
+      // everything else the on-disk copy wins: otherwise a sibling's completed
+      // job would be rewritten as whatever stale state we happened to hold.
+      if (this.owned.has(meta.id)) continue;
+      this.jobs.set(meta.id, {
+        ...meta,
+        events: mine.events,
+        cursor: mine.cursor,
+        result: mine.result,
+      });
+      refreshed += 1;
+    }
+    if (adopted > 0 || refreshed > 0) {
+      this.evict();
+      this.log?.warn('merged index written by another bridge instance', {
+        adopted,
+        refreshed,
+        file: this.indexFile,
+        hint: 'prefer a distinct CURSOR_BRIDGE_STATE_DIR per instance; history is merged, not lost',
+      });
+    }
+  }
+
   persist(): void {
+    this.absorbForeignWrites();
     const payload: PersistedIndex = {
       version: 1,
       updatedAt: new Date().toISOString(),
@@ -261,6 +419,27 @@ export class JobStore {
         durationMs: j.durationMs,
         truncated: j.truncated,
         pendingInput: j.pendingInput,
+        // Artefact pointers must survive a restart: an input-required task can
+        // sit for days, and resuming it after a bridge restart must still find
+        // the patch of the pass that paused. Paths are derived from stateDir at
+        // capture time, so they stay valid for the same deployment.
+        inputRequiredAt: j.inputRequiredAt,
+        model: j.model,
+        isolation: j.isolation,
+        changedFiles: j.changedFiles,
+        diffStat: j.diffStat,
+        patchFile: j.patchFile,
+        reportFile: j.reportFile,
+        pid: j.pid,
+        // The final answer must survive a restart: `tasks/get` on a completed
+        // task used to return a status with no result, and a polling client had
+        // no way to recover it (the events are not re-read from disk).
+        result: j.result,
+        // Persist the sequence so a client's `since` keeps working after a
+        // restart; resetting to 0 made every incremental poller silently miss
+        // every event of every later task.
+        cursor: j.cursor,
+        owner: this.instanceId,
       })),
     };
     try {
@@ -270,6 +449,7 @@ export class JobStore {
       fs.renameSync(tmp, this.indexFile);
       this.dirty = false;
       this.persistFailures = 0;
+      this.lastSnapshot = this.snapshotKey();
     } catch (err) {
       this.persistFailures += 1;
       this.log?.error('index persist failed', {
@@ -307,6 +487,11 @@ export class JobStore {
   }
 
   /** Evict oldest *finished* jobs once the cap is exceeded. */
+  /** Public hook: terminal transitions can push the store over `maxJobs`. */
+  evictNow(): void {
+    this.evict();
+  }
+
   private evict(): void {
     if (this.jobs.size <= this.limits.maxJobs) return;
     const finished = [...this.jobs.values()]
@@ -315,6 +500,33 @@ export class JobStore {
     while (this.jobs.size > this.limits.maxJobs && finished.length > 0) {
       const victim = finished.shift()!;
       this.jobs.delete(victim.id);
+      /**
+       * Eviction used to be bookkeeping only: the patch directory and the
+       * JSONL event log stayed on disk forever, so a long-lived bridge grew
+       * without bound while `/metrics` reported a healthy, capped job count.
+       */
+      this.discardFiles(victim.id);
     }
+  }
+
+  /** Remove the on-disk artefacts and event log of a job. Never throws. */
+  discardFiles(id: string): void {
+    const stateDir = path.dirname(this.indexFile);
+    const targets = [path.join(stateDir, 'artifacts', id)];
+    if (this.eventLogDir) targets.push(path.join(this.eventLogDir, id));
+    for (const dir of targets) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch (err) {
+        this.log?.warn('artifact cleanup failed', { id, dir, err: String(err) });
+      }
+    }
+  }
+
+  /** Number of jobs that are still live (running or awaiting input). */
+  liveCount(): number {
+    let n = 0;
+    for (const j of this.jobs.values()) if (isLive(j.status)) n += 1;
+    return n;
   }
 }

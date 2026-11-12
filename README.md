@@ -122,6 +122,10 @@ pushNotifications / stateTransitionHistory）、按 workspace root 派生的 `sk
 
 > **A2A 文本在 `parts[].text`，不在顶层 `.text`；`taskId` 是 Message 的顶层字段**（不在 metadata）。
 > 续跑/跟进沿用父任务的 `contextId`；产物以标准 `Artifact[]` 暴露，input-required 中断态保留在同一任务 id 上。
+>
+> **中断不等于丢弃**：暂停时已产生的改动会落盘为 patch，续跑轮自动回放到新 worktree，
+> 桥重启后同样成立。若无法回放（基线移动等），任务退回 `input-required` 并写明原因，
+> 绝不在残缺的代码树上继续执行。
 
 ### 推送通知（可选）
 
@@ -171,13 +175,17 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 
 | 键 / 环境变量 | 默认 | 说明 |
 |---|---|---|
-| `cursorBin` / `CURSOR_BIN` | `agent.exe` | Cursor CLI 路径 |
+| `cursorBin` / `CURSOR_BIN` | `agent.exe` | Cursor CLI 路径。Windows 上若指向 `.js`/`.mjs`，会改用当前 Node 执行该脚本（不经过 shell），便于用脚本替身做联调；`.cmd`/`.bat` 无法被无 shell 启动，会直接失败 |
 | `workspaceRoots` / `CURSOR_BRIDGE_WORKSPACE_ROOTS` | 空 | 允许的仓库根，`;` 分隔；为空则**所有任务被拒** |
 | `stateDir` / `CURSOR_BRIDGE_STATE_DIR` | `%LOCALAPPDATA%\wb-cursor-bridge` | 索引、日志、产物 |
 | `defaultTimeoutSec` / `CURSOR_BRIDGE_TIMEOUT_SEC` | `900` | 单任务墙钟上限 |
-| `maxConcurrency` / `CURSOR_BRIDGE_MAX_CONCURRENCY` | `4` | 超限快速失败 |
+| `maxConcurrency` / `CURSOR_BRIDGE_MAX_CONCURRENCY` | `4` | 同时在跑的 worker 上限，超限快速失败（`-32006`） |
+| `maxLiveJobs` / `CURSOR_BRIDGE_MAX_LIVE_JOBS` | `20` | 「活任务」上限：`running` + `input-required`。只算历史条的 `maxJobs` 拦不住暂停任务堆积 |
+| `inputRequiredTtlSec` / `CURSOR_BRIDGE_INPUT_TTL_SEC` | `86400` | `input-required` 任务的存活期，过期转 `cancelled` 并清理产物（`[60, 30d]`） |
+| `maxEventBytes` / `CURSOR_BRIDGE_MAX_EVENT_BYTES` | `4 MiB` | 单任务事件环的**字节**预算。`maxEventsPerJob` 只限条数，2000 条 × 1 MiB 仍可撑爆内存 |
+| `envPassthrough` / `CURSOR_BRIDGE_ENV_PASSTHROUGH` | 空 | 额外透传给 worker 的环境变量名（逗号分隔）。默认只传 `PATH/HOME/LANG/代理/CURSOR_*/WB_*` 等，且丢弃含 `TOKEN/SECRET/KEY/AUTH` 的名字 |
 | `adminPort` / `CURSOR_BRIDGE_ADMIN_PORT` | `0`（关闭） | 开启后提供 `/healthz` `/stats` `/jobs`（仅监听 127.0.0.1） |
-| `adminShutdownToken` / `CURSOR_BRIDGE_ADMIN_SHUTDOWN_TOKEN` | 空 | 设置后 `/admin/shutdown` 需携带 token |
+| `adminShutdownToken` / `CURSOR_BRIDGE_ADMIN_SHUTDOWN_TOKEN` | 空 | **未设置时 `/admin/shutdown` 直接禁用（503）**；设置后必须 `POST` + `X-Shutdown-Token` 头（不再接受 query token） |
 | `eventLogDir` / `CURSOR_BRIDGE_EVENT_LOG_DIR` | 空 | 设置后每个 job 的事件会异步追加到 `<dir>/<jobId>/events.jsonl` |
 | `persistEvents` / `CURSOR_BRIDGE_PERSIST_EVENTS` | `0` | 设为 `1` 时自动使用 `<stateDir>/events` |
 | `logLevel` / `CURSOR_BRIDGE_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
@@ -189,7 +197,8 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 | `a2aProtocolVersion` / `CURSOR_BRIDGE_A2A_PROTOCOL_VERSION` | `0.3.0` | A2A 协议版本；设为 `1.0` 即输出 v1.0 合规的 Agent Card 与 Task（FileContent 字段重映射 `name→filename`/`mimeType→mediaType`/`uri→url`/`bytes_inline→raw`、`protocolVersion` 移入 `supportedInterfaces`、新增 `extensions[]`）。默认 `0.3.0` 保持零回归 |
 | `a2aBlockingMaxMs` / `CURSOR_BRIDGE_A2A_BLOCKING_MAX_MS` | `90000` | `message/send` 在 `configuration.blocking` 为真时阻塞等待任务终态的上限（ms），区间 `[1000, 600000]`；超时回异步 task |
 | `a2aRateLimitPerSec` / `CURSOR_BRIDGE_A2A_RATE_LIMIT_PER_SEC` | `250` | `POST /a2a` 令牌桶限流速率（请求/秒），区间 `[1, 100000]`；超限返回 `429 RATE_LIMITED(-32050)` |
-| `a2aCorsOrigins` / `CURSOR_BRIDGE_A2A_CORS_ORIGINS` | 空 | 逗号分隔的允许跨域 origin 列表；命中时反射 `Access-Control-Allow-Origin`，默认关闭（不输出任何 CORS 头） |
+| `a2aCorsOrigins` / `CURSOR_BRIDGE_A2A_CORS_ORIGINS` | 空 | 逗号分隔的允许跨域 origin 列表；命中时反射 `Access-Control-Allow-Origin`（并带 `Vary: origin`），默认关闭（不输出任何 CORS 头） |
+| `a2aCorsAllowCredentials` / `CURSOR_BRIDGE_A2A_CORS_ALLOW_CREDENTIALS` | `false` | 为允许的来源发送 `Access-Control-Allow-Credentials`。与通配 `*` 组合会在启动时被拒绝——反射任意来源又允许凭证等于全网可读 |
 | `a2aSkills` / `file.a2aSkills` | 空 | 额外 skill 声明（`ExtraSkill[]`：`{ id, name, root, description?, tags?, tier? }`），`root` 自动 `expandPath` 且须落在 `workspaceRoots` 内，越界被 `log.warn` 丢弃 |
 
 ---
@@ -197,8 +206,12 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 ## 安全模型
 
 - **工作区白名单**：路径需同时通过字面与 realpath 双重校验；拒绝 `..` 越界、符号链接逃逸、NUL 字节、DOS 保留设备名、8.3 短名。
-- **进程隔离**：`execute` 永远在独立 git worktree 内执行；Windows 上用 `taskkill /T /F` 杀整棵进程树，POSIX 上杀进程组。
-- **资源上限**：超时强杀、并发上限、结果体积上限、事件环形缓冲、job LRU。
+- **进程隔离（fail closed）**：`execute` 必须在独立 git worktree 内执行；非 git 目录、worktree 创建失败、子目录越界一律**拒绝任务**，绝不降级为在调用方 checkout 里 `--force` 直写。每次尝试用唯一目录名（`jobId + 时间 + 随机`），续跑撞不上上一次的残留。
+- **参数边界**：prompt 前固定加 `--` 终止符，`model` 不许以 `-` 开头——否则 `prompt: "--force"` 会被当成 flag，把 consult 档升级成写权限。
+- **环境隔离**：worker 只继承白名单 env；宿主密钥（`*TOKEN*`/`*SECRET*`/`*KEY*`）默认不可见，需要时用 `CURSOR_BRIDGE_ENV_PASSTHROUGH` 逐个点名。
+- **HTTP 面**：`headersTimeout=10s` / `requestTimeout=60s` / `keepAliveTimeout=5s` / `maxConnections=512`；限流按来源 IP 分桶（原先单桶=一个客户端能把所有人打成 429），SSE 不受请求超时影响。
+- **进程回收**：worker pid 落盘，重启后校验 `/proc/<pid>/cmdline` 再回收上一条命遗留的 agent；pid 被复用时不会误杀。
+- **资源上限**：超时强杀、并发上限、活任务上限、暂停 TTL、结果体积上限、事件环字节上限、job LRU，淘汰时同步删除磁盘产物与事件日志。
 - **审计**：任务索引与产物原子落盘；可选开启事件 JSONL 持久化（`CURSOR_BRIDGE_PERSIST_EVENTS=1`）以满足强审计需求。崩溃后重启会把遗留 `running` 任务标记为 `orphaned`。
 - **stdout 洁癖**：任何 `console.log` 都被重定向到 stderr，避免污染 JSON-RPC 流。
 
@@ -213,16 +226,17 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 
 ```bash
 npm install
+npm run lint             # ESLint（correctness 规则；0 error 才放行）
 npm run typecheck        # tsc --noEmit
-npm test                 # 97 项：49 单元 + 15 端到端 + 3 admin HTTP + 30 A2A
+npm test                 # 151 项：单元 + 硬化 + 端到端 + admin + A2A + 审计回归（test/audit-b0）
 npm run test:stress      # 压力：高并发 / 反复 cancel-reply / hang 超时
 npm run test:fault       # 故障：磁盘/权限异常的优雅降级
-npm run verify           # 门禁：typecheck + npm test + stress + fault + release 构建
-npm run test:a2a         # 仅跑 A2A 互操作 30 项（Agent Card / message/send / tasks/get / cancel / stream / push / auth / blocking / 协商 / 限流 / CORS / v1.0 / skills）
-npm run verify:e2e       # 端到端真跑实证：真实 dist 二进制 + fake-agent，54 项（v0.3.0/v1.0/鉴权/限流/CORS/产物可达/input-required 续跑/push 真投 + SSRF 拒绝/tasks/cancel 真实取消与清理/崩溃清理…），已纳入 Linux CI 门禁（脚本已跨平台可跑，Windows CI 待验证后启用）
+npm run test:audit       # 第三方审计 PoC 的反向回归（修复后必须绿）
+npm run test:a2a         # 仅跑 A2A 互操作（Agent Card / message/send / tasks/get / cancel / stream / push / auth / blocking / 协商 / 限流 / CORS / v1.0 / skills）
+npm run verify           # 门禁：lint + typecheck + npm test + stress + fault + release 构建
+npm run verify:e2e       # 端到端真跑实证：真实 dist 二进制 + fake-agent，54 项（v0.3.0/v1.0/鉴权/限流/CORS/产物可达/input-required 续跑/push 真投 + SSRF 拒绝/tasks/cancel 真实取消与清理/崩溃清理…）；Linux 与 Windows CI 均执行
 npm run build            # 编译到 dist/
 npm run build:release    # 产出 release/wb-cursor-bridge-v<version>-win-x64.zip
-npm run verify           # 上述全流程（不含 stress/fault）
 ```
 
 端到端测试用一个模拟 `agent` 二进制（`test/fake-agent.mjs`）讲同一种 stream-json 协议，因此**无需 Cursor 账号或网络**即可验证全链路。真实 Cursor CLI 集成见下文。
@@ -274,7 +288,8 @@ scripts/
 | 启动即退出码 2 | 配置非法，看 `%LOCALAPPDATA%\wb-cursor-bridge\bridge.log` |
 | MCP 工具没出现 | 确认配置写在 `~/.codebuddy/.mcp.json` / `~/.cursor/mcp.json`，并重启客户端 |
 | 想看实时状态 | 设 `adminPort`，访问 `http://127.0.0.1:<port>/healthz` |
-| shutdown 端点 401 | 设置了 `adminShutdownToken`，请求需带 header `X-Shutdown-Token: <token>` 或 query `?token=<token>` |
+| shutdown 端点 503 | 未设置 `adminShutdownToken`——该端点默认禁用（fail closed）；设置后必须 `POST` 并带 header `X-Shutdown-Token: <token>` |
+| shutdown 端点 401 | 设置了 token 但请求未带/带错 header；query `?token=` 已不再接受 |
 | A2A 端点 401 | 设置了 `a2aAuthToken`，`POST /a2a`、`/healthz`、`/metrics`、`/version`、产物下载均需 `Authorization: Bearer <token>` 或 `X-A2A-Token: <token>`；Agent Card 端点无需鉴权 |
 | A2A 控制面暴露告警 | 把 `a2aHost` 设为 `0.0.0.0` 却未设 `a2aAuthToken`，启动会打印告警——控制面将对全网可达，务必同时设置 token |
 | push 通知没生效 | 开启 push 必须设置 `a2aAuthToken`；webhook 目标为私有/loopback 时需把主机加入 `a2aPushUrlAllowlist`（SSRF 防护） |
@@ -287,6 +302,9 @@ scripts/
 
 | 版本 | 要点 |
 |---|---|
+| **0.4.3** | 工程门禁：ESLint 接入 `verify`/`prepublishOnly`；Windows CI 补齐 a2a/stress/fault（新增 `resolveSpawnTarget`，Windows 上以当前 Node 执行 `.mjs` 假 Agent，绕开 `.cmd` 无法无 shell spawn 的限制）；修掉一个一直空转的 worktree 泄漏断言，130 项测试 |
+| **0.4.2** | 非法配置不再静默回退（`=15m` 以前会变成 900s）、CORS 通配不再授予凭证、多实例共享 stateDir 不再互删 worktree（`worktrees/<instanceId>/` + `owner.json`，`index.json` 记 owner 避免误判孤儿），129 项测试 |
+| **0.4.1** | 修复 `input-required` 暂停期丢失已写文件（续跑前自动回放暂停时的 patch，失败则 fail closed 而非在残缺树上继续）+ patch 产物持久化（桥重启后仍可续跑）+ `captureDiff --binary` + 续跑拒绝静默换档 + 流式缓冲硬上限 + blocking 断连不再空转，110 项测试 |
 | **0.4.0** | A+ 路线图收尾：消费 `configuration.blocking`/`acceptedOutputModes`/`historyLength`、JSON-RPC 通知不回包、令牌桶限流、CORS、`unhandledRejection` 阈值退出、`bridge_shutdown` flush、worktree `try/finally` 清理、`src/artifacts.ts` 解耦、skill 多扩展点、**A2A v1.0 迁移路线**（`compat.ts` 双版本序列化），97 项测试 |
 | **0.3.4** | A2A 真互联：Agent Card 发现 + JSON-RPC 语义层（message/send、tasks/get、tasks/cancel、message/stream SSE、push 通知、Bearer 鉴权）；生产级硬化（LRU 保 input-required、文件产物可寻址、SSRF 防护、资源/并发修复、/healthz /metrics /version），83 项测试 |
 | **0.3.3** | P3 加固：可选事件 JSONL 持久化、压力/故障测试、Node 镜像与离线包、Windows CI、metrics 说明 |

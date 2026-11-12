@@ -71,8 +71,7 @@ export async function* subscribeTask(
 ): AsyncGenerator<TaskEvent> {
   let lastState: TaskState | undefined;
   let lastCursor = -1;
-  let lastArtifactCount = 0;
-  let emittedArtifactFor: Set<string> = new Set();
+  const emittedArtifactFor: Set<string> = new Set();
 
   const done = () => signal?.aborted ?? false;
 
@@ -82,12 +81,18 @@ export async function* subscribeTask(
   if (snap) {
     lastState = snap.state;
     lastCursor = snap.cursor;
-    lastArtifactCount = snap.artifactCount;
-    yield statusEvent(snap, isFinalState(snap.state));
+    /**
+     * Artifacts FIRST, then the status event. The terminal status event is the
+     * last thing a client consumes (the transport closes the stream on it), so
+     * anything emitted after it is never read. That ordering is exactly why
+     * every stream reported `status-update(completed)` and zero artifacts even
+     * though the task carried a patch and a report.
+     */
     for (const a of snap.task.artifacts ?? []) {
       emittedArtifactFor.add(a.artifactId);
       yield artifactEvent(snap, a, false, true);
     }
+    yield statusEvent(snap, isFinalState(snap.state));
     if (isFinalState(snap.state)) return;
   }
 
@@ -111,19 +116,19 @@ export async function* subscribeTask(
     const stateChanged = snap.state !== lastState;
     const progressed = snap.cursor > lastCursor;
 
-    if (stateChanged || progressed) {
-      yield statusEvent(snap, isFinalState(snap.state));
-      lastState = snap.state;
-      lastCursor = snap.cursor;
-    }
-
+    // Same rule as the prime block: deliverables before the terminal status.
     for (const a of snap.task.artifacts ?? []) {
       if (!emittedArtifactFor.has(a.artifactId)) {
         emittedArtifactFor.add(a.artifactId);
         yield artifactEvent(snap, a, false, true);
       }
     }
-    lastArtifactCount = snap.artifactCount;
+
+    if (stateChanged || progressed) {
+      yield statusEvent(snap, isFinalState(snap.state));
+      lastState = snap.state;
+      lastCursor = snap.cursor;
+    }
 
     if (isFinalState(snap.state)) return;
   }
@@ -179,7 +184,14 @@ async function postPush(push: PushNotificationConfig, body: unknown): Promise<vo
         method: 'POST',
         headers,
         body: payload,
+        // A redirect is a second, unvalidated request: the SSRF gate only saw
+        // the original URL. Refuse to follow and let the delivery fail.
+        redirect: 'manual',
       });
+      if (res.status >= 300 && res.status < 400) {
+        // Do not log the URL or the Location header: both can carry secrets.
+        return;
+      }
       if (res.ok) return;
       if (attempt === 3) {
         // non-2xx; give up after retries but do not throw into the watcher

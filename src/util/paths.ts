@@ -8,8 +8,9 @@
  *  - Trailing separators must not change the answer
  *  - Junctions and symlinks can point outside an allowed root, so the *real*
  *    path is compared, not the literal one
- *  - 8.3 short names (C:\REPO~1) can alias a real directory, so short names
- *    are rejected outright rather than trusted
+ *  - 8.3 short names (C:\Users\RUNNER~1) are *expanded*, not rejected: they
+ *    are a legitimate spelling of the same directory, and rejecting them
+ *    failed every GitHub Windows runner (whose %TEMP% is the short form)
  *  - Reserved DOS device names must never be treated as directories
  */
 import fs from 'node:fs';
@@ -21,9 +22,6 @@ const IS_WIN = process.platform === 'win32';
 /** DOS device names that cannot be used as a directory component. */
 const RESERVED =
   /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i;
-
-/** A 8.3 short-name component such as "REPO~1". */
-const SHORT_NAME = /~[0-9]+$/i;
 
 /**
  * Canonical form used for comparisons.
@@ -62,7 +60,17 @@ export function isInside(child: string, parent: string): boolean {
   return c.startsWith(p.endsWith(sep) ? p : p + sep);
 }
 
-/** Hard-fail on inputs that are never acceptable, even if inside a root. */
+/**
+ * Hard-fail on inputs that are never acceptable, even if inside a root.
+ *
+ * Note: an 8.3-shaped component (`REPO~1`) is deliberately NOT rejected here.
+ * The earlier revision did reject it, and that single line failed all 11
+ * Windows CI e2e cases: GitHub's Windows runners have
+ * `%TEMP% = C:\Users\RUNNER~1\AppData\Local\Temp`, so *every* temp repo was
+ * refused. A short name is not a traversal primitive — it always aliases an
+ * entry in the same parent, and `realpathSync.native` expands it, so the
+ * containment gate below sees the real directory either way.
+ */
 function assertSaneShape(target: string): void {
   if (!target || target.trim() !== target) {
     throw pathDenied(`path contains leading/trailing whitespace: "${target}"`);
@@ -74,20 +82,19 @@ function assertSaneShape(target: string): void {
     if (RESERVED.test(seg)) {
       throw pathDenied(`path contains reserved device name "${seg}"`);
     }
-    if (SHORT_NAME.test(seg)) {
-      throw pathDenied(
-        `path contains an 8.3 short name ("${seg}"); use the long name`,
-      );
-    }
   }
 }
 
 /**
  * Validate that `workspace` is an existing directory inside one of `roots`.
- * Returns the canonical directory path.
+ * Returns the resolved (real) directory path — the one the job will actually use.
  *
- * Both the literal path and its resolved real path must be contained: that
- * blocks the case where an allowed path is later replaced by a junction.
+ * Containment is decided on the *resolved* path for both sides. Comparing the
+ * literal string instead is what produced the `RUNNER~1` false positive: the
+ * root was configured in long form, the caller passed the short form, the
+ * strings differed, and a legitimate directory was denied. The security
+ * property is unchanged — a junction or symlink still resolves outside the
+ * root and is still rejected, because `realpath` is what we compare.
  */
 export function assertWorkspaceAllowed(
   workspace: string,
@@ -100,9 +107,22 @@ export function assertWorkspaceAllowed(
   }
   assertSaneShape(workspace);
 
-  const abs = canonical(workspace);
-  const literalOk = roots.some((r) => isInside(abs, r));
-  if (!literalOk) {
+  // Resolve once; `realpathOrSelf` falls back to the literal form for paths
+  // that do not exist yet, so a missing workspace still reports `not found`
+  // rather than `outside every root`.
+  const target = realpathOrSelf(workspace);
+  const inside = roots.some((r) => isInside(target, realpathOrSelf(r)));
+  if (!inside) {
+    // Distinguish the two failure modes for the operator: "you pointed outside"
+    // versus "this path used to be inside but resolves elsewhere now" (a
+    // junction/symlink swap). The second one is the security-relevant one.
+    const literal = canonical(workspace);
+    const lookedInside = roots.some((r) => isInside(literal, canonical(r)));
+    if (lookedInside && target !== literal) {
+      throw pathDenied(
+        `workspace "${workspace}" resolves to "${target}", which escapes the configured roots`,
+      );
+    }
     throw pathDenied(
       `workspace "${workspace}" is outside every configured root (${roots.join('; ')})`,
     );
@@ -110,7 +130,7 @@ export function assertWorkspaceAllowed(
 
   let stat: fs.Stats;
   try {
-    stat = fs.statSync(abs);
+    stat = fs.statSync(target);
   } catch {
     throw notFound(`workspace "${workspace}" does not exist`);
   }
@@ -118,19 +138,7 @@ export function assertWorkspaceAllowed(
     throw pathDenied(`workspace "${workspace}" is not a directory`);
   }
 
-  // Second gate: the resolved location must also be contained.
-  const real = realpathOrSelf(abs);
-  const realOk = roots.some((r) => {
-    const rootReal = fs.existsSync(r) ? realpathOrSelf(r) : canonical(r);
-    return isInside(real, rootReal);
-  });
-  if (!realOk) {
-    throw pathDenied(
-      `workspace "${workspace}" resolves to "${real}", which escapes the configured roots`,
-    );
-  }
-
-  return real;
+  return target;
 }
 
 /** Expand `%VAR%` and `~` without letting user input reach a shell. */

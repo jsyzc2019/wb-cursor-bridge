@@ -73,11 +73,22 @@ export async function createWorktree(
 export async function captureDiff(
   worktreePath: string,
   outFile: string,
+  /**
+   * The commit the worktree was created from. Diffing against `HEAD` looks
+   * right until the agent commits its own work: HEAD then *is* the change, the
+   * diff is empty, and the deliverables (files + patch) silently vanish while
+   * the commit ends up unreachable after the worktree is removed. Anchoring to
+   * the creation commit makes committed work visible again.
+   */
+  baseCommit = 'HEAD',
 ): Promise<{ file: string; bytes: number } | null> {
   try {
     // Stage everything first so newly created files appear in the patch.
     await git(worktreePath, ['add', '-A'], 30_000);
-    const patch = await git(worktreePath, ['diff', '--cached', 'HEAD'], 30_000);
+    // `--binary` embeds binary blobs as base64. Without it git emits
+    // "Binary files differ", which cannot be re-applied when a paused task is
+    // resumed - images and other assets would silently block the restore.
+    const patch = await git(worktreePath, ['diff', '--cached', '--binary', baseCommit], 30_000);
     if (!patch.trim()) return null;
     fs.mkdirSync(path.dirname(outFile), { recursive: true });
     fs.writeFileSync(outFile, patch, 'utf8');
@@ -87,24 +98,64 @@ export async function captureDiff(
   }
 }
 
-/** Short diffstat, useful as a cheap summary in a polling response. */
-export async function diffStat(worktreePath: string): Promise<string> {
+/**
+ * Re-apply a patch captured during an earlier pass into a fresh worktree.
+ *
+ * A paused (`input-required`) task holds no live worktree: the worktree is torn
+ * down when the pass ends and the next pass starts from a clean checkout of
+ * HEAD. Without this step every file the worker wrote before asking its
+ * question would silently disappear, and the resumed thread would reason about
+ * code that no longer exists.
+ *
+ * Returns a structured failure instead of throwing so the caller can decide to
+ * fail closed rather than run the worker on a half-restored tree.
+ */
+export async function applyPatch(
+  worktreePath: string,
+  patchFile: string,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!fs.existsSync(patchFile)) {
+    return { ok: false, reason: `saved patch is missing: ${patchFile}` };
+  }
   try {
-    return (await git(worktreePath, ['diff', '--cached', '--stat', 'HEAD'], 20_000)).trim();
+    await git(worktreePath, ['apply', '--index', '--whitespace=nowarn', patchFile], 60_000);
+    return { ok: true };
+  } catch (direct) {
+    // The base may have moved while the task was paused (the caller committed).
+    // A three-way merge recovers the common case; the blob objects are still in
+    // the shared object store because `captureDiff` staged them before diffing.
+    try {
+      await git(
+        worktreePath,
+        ['apply', '--index', '--3way', '--whitespace=nowarn', patchFile],
+        60_000,
+      );
+      return { ok: true };
+    } catch {
+      const raw = direct instanceof Error ? direct.message : String(direct);
+      return { ok: false, reason: raw.split('\n').filter(Boolean).slice(0, 3).join(' ').trim() };
+    }
+  }
+}
+
+/** Short diffstat, useful as a cheap summary in a polling response. */
+export async function diffStat(worktreePath: string, baseCommit = 'HEAD'): Promise<string> {
+  try {
+    return (await git(worktreePath, ['diff', '--cached', '--stat', baseCommit], 20_000)).trim();
   } catch {
     return '';
   }
 }
 
 /** Files changed in the worktree relative to HEAD, including new ones. */
-export async function changedFiles(worktreePath: string): Promise<string[]> {
+export async function changedFiles(worktreePath: string, baseCommit = 'HEAD'): Promise<string[]> {
   try {
     // `git diff HEAD` alone omits untracked files, which is exactly what an
     // agent creates most often. Stage first so new files are visible.
     await git(worktreePath, ['add', '-A'], 30_000);
     const out = await git(
       worktreePath,
-      ['diff', '--cached', '--name-only', 'HEAD'],
+      ['diff', '--cached', '--name-only', baseCommit],
       20_000,
     );
     return out.split('\n').map((s) => s.trim()).filter(Boolean);
@@ -116,7 +167,15 @@ export async function changedFiles(worktreePath: string): Promise<string[]> {
 /**
  * Remove a worktree, pruning metadata and tolerating a dirty tree.
  * Never throws: cleanup must not mask a job result.
+ *
+ * Windows specific: `git worktree remove` can fail while any handle is still
+ * open inside the tree (an agent that just exited still holds its cwd for a
+ * few hundred ms), and a single `rmSync` then fails with EBUSY/EPERM. A short
+ * bounded retry is what makes "the worktree is gone when the job settles"
+ * true on Windows instead of merely true on POSIX.
  */
+const WINDOWS_LOCK_CODES = new Set(['EBUSY', 'EPERM', 'ENOTEMPTY', 'EACCES']);
+
 export async function removeWorktree(wt: Worktree): Promise<void> {
   try {
     await git(wt.repo, ['worktree', 'remove', '--force', wt.path], 30_000);
@@ -127,24 +186,38 @@ export async function removeWorktree(wt: Worktree): Promise<void> {
       /* give up quietly */
     }
   }
-  try {
-    fs.rmSync(wt.path, { recursive: true, force: true });
-  } catch {
-    /* ignore */
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    try {
+      fs.rmSync(wt.path, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
+      return;
+    } catch (err) {
+      const code: unknown = (err as { code?: unknown }).code;
+      // A real error (ENOTDIR, ENOENT on a parent…) means there is nothing to
+      // reclaim; only lock contention is worth waiting out.
+      if (typeof code !== 'string' || !WINDOWS_LOCK_CODES.has(code)) return;
+      await new Promise((r) => setTimeout(r, 150));
+    }
   }
 }
 
-/** Drop every worktree this bridge owns; run at startup and on exit. */
-export async function pruneOwnedWorktrees(repo: string, containerDir: string): Promise<void> {
+/**
+ * Drop stale git worktree *metadata* for a repo.
+ *
+ * This only removes bookkeeping entries whose checkout directory is already
+ * gone - it never deletes a live checkout. Reclaiming actual directories is
+ * the job of `pruneStaleInstanceDirs`, which knows which owner still exists;
+ * the previous version deleted every directory under the shared
+ * `<stateDir>/worktrees`, so a second bridge starting up would wipe the
+ * worktrees a first, still-running bridge was executing inside.
+ */
+export async function pruneWorktreeMetadata(repo: string): Promise<void> {
   try {
     await git(repo, ['worktree', 'prune'], 15_000);
-  } catch {
-    /* ignore */
-  }
-  try {
-    for (const entry of fs.readdirSync(containerDir)) {
-      fs.rmSync(path.join(containerDir, entry), { recursive: true, force: true });
-    }
   } catch {
     /* ignore */
   }

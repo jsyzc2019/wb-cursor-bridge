@@ -13,7 +13,7 @@
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File uninstall.ps1 -Purge
 #>
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
   [string] $InstallDir = "$env:LOCALAPPDATA\Programs\wb-cursor-bridge",
   [string] $StateDir   = "$env:LOCALAPPDATA\wb-cursor-bridge",
@@ -26,6 +26,33 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:Source = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# A directory may only be deleted recursively when it actually looks like one of
+# our payloads. Without this, running the script from the wrong folder (or from
+# Downloads, which is where browsers put extracted archives) with -RemovePayload
+# deleted whatever happened to be next to it.
+function Test-BridgePayload([string] $Dir) {
+  if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return $false }
+  $marker = Join-Path $Dir 'lib\index.mjs'
+  $version = Join-Path $Dir 'VERSION'
+  return (Test-Path -LiteralPath $marker) -and (Test-Path -LiteralPath $version)
+}
+
+# Refuse obviously dangerous roots: a drive root, the user profile, Desktop, My Documents.
+function Test-SafeRemovalTarget([string] $Dir) {
+  if (-not $Dir) { return $false }
+  $full = [System.IO.Path]::GetFullPath($Dir).TrimEnd('\')
+  if ($full -match '^[A-Za-z]:$') { return $false }
+  $forbidden = @(
+    [Environment]::GetFolderPath('UserProfile'),
+    [Environment]::GetFolderPath('Desktop'),
+    [Environment]::GetFolderPath('MyDocuments')
+  )
+  foreach ($f in $forbidden) {
+    if ($f -and $full -eq ([System.IO.Path]::GetFullPath($f).TrimEnd('\'))) { return $false }
+  }
+  return $true
+}
 . (Join-Path $script:Source 'lib\McpConfig.ps1')
 
 function Write-Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
@@ -64,25 +91,41 @@ if ($RemovePayload) {
   $normSource = [System.IO.Path]::GetFullPath($script:Source).TrimEnd('\')
   $normInstall = [System.IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
   if ($normSource -ne $normInstall -and (Test-Path $script:Source)) {
-    Write-Step 'Removing the extracted archive'
-    Remove-Item $script:Source -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Ok "removed $script:Source"
+    if (-not (Test-BridgePayload $script:Source)) {
+      Write-Warn "refusing to delete $script:Source : it is not a wb-cursor-bridge payload"
+    } elseif (-not (Test-SafeRemovalTarget $script:Source)) {
+      Write-Warn "refusing to delete $script:Source : it is a protected location"
+    } elseif ($PSCmdlet.ShouldProcess($script:Source, 'Remove extracted payload')) {
+      Write-Step 'Removing the extracted archive'
+      Remove-Item -LiteralPath $script:Source -Recurse -Force -ErrorAction SilentlyContinue
+      Write-Ok "removed $script:Source"
+    }
   } else {
     Write-Ok 'running from the install directory; nothing extra to remove'
   }
 }
 
 if (Test-Path $InstallDir) {
-  Write-Step "Removing $InstallDir"
-  Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
-  Write-Ok 'install directory removed'
+  if (-not (Test-BridgePayload $InstallDir)) {
+    Write-Warn "refusing to delete $InstallDir : it does not contain an installed bridge"
+  } elseif (-not (Test-SafeRemovalTarget $InstallDir)) {
+    Write-Warn "refusing to delete $InstallDir : it is a protected location"
+  } elseif ($PSCmdlet.ShouldProcess($InstallDir, 'Remove install directory')) {
+    Write-Step "Removing $InstallDir"
+    Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Ok 'install directory removed'
+  }
 }
 
 if ($Purge) {
   if (Test-Path $StateDir) {
-    Write-Step "Purging $StateDir"
-    Remove-Item $StateDir -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Ok 'state and logs removed'
+    if (-not (Test-SafeRemovalTarget $StateDir)) {
+      Write-Warn "refusing to purge $StateDir : it is a protected location"
+    } elseif ($PSCmdlet.ShouldProcess($StateDir, 'Purge state directory')) {
+      Write-Step "Purging $StateDir"
+      Remove-Item -LiteralPath $StateDir -Recurse -Force -ErrorAction SilentlyContinue
+      Write-Ok 'state and logs removed'
+    }
   }
 } elseif (Test-Path $StateDir) {
   Write-Ok "state kept at $StateDir (pass -Purge to delete it)"

@@ -13,19 +13,21 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, writeFileSync, rmSync, chmodSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, mkdirSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { JobManager } from '../dist/runner.js';
+import { pollDelay } from './client.mjs';
 import { Logger } from '../dist/logger.js';
 import { startA2AServer } from '../dist/a2a/server.js';
 import { VERSION } from '../dist/version.js';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const FAKE = path.join(ROOT, 'test', 'a2a-fake-agent.mjs');
+import { fakeBin } from './fake-bin.mjs';
+import { rmrf } from './tmp.mjs';
+
+const FAKE = fakeBin('a2a');
 
 // The bridge spawns the fake agent as a real executable, so it must be
 // executable for the whole suite. Do this once at import time.
@@ -129,14 +131,14 @@ function messageText(message) {
 async function rmSafe(target) {
   for (let i = 0; i < 20; i += 1) {
     try {
-      rmSync(target, { recursive: true, force: true });
+      rmrf(target);
       return;
     } catch {
       await new Promise((r) => setTimeout(r, 200));
     }
   }
   try {
-    rmSync(target, { recursive: true, force: true });
+    rmrf(target);
   } catch {
     /* give up quietly */
   }
@@ -144,14 +146,14 @@ async function rmSafe(target) {
 
 async function waitForTask(base, id, states, timeoutMs = 12000) {
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
+  for (let attempt = 0; ; attempt += 1) {
     const { body } = await rpc(base, 'tasks/get', { id, historyLength: 20 });
     const state = body.result?.status?.state;
     if (states.includes(state)) return body.result;
     if (Date.now() > deadline) {
       throw new Error(`task ${id} did not reach ${states.join('/')} (stuck at ${state})`);
     }
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, pollDelay(attempt)));
   }
 }
 
@@ -172,7 +174,10 @@ async function readSse(response, timeoutMs = 15000) {
       buf = buf.slice(idx + 2);
       for (const line of chunk.split('\n')) {
         if (line.startsWith('data: ')) {
-          events.push(JSON.parse(line.slice(6)));
+          const frame = JSON.parse(line.slice(6));
+          // Spec-compliant frames are JSON-RPC responses; accept both shapes so
+          // the assertion below stays about behaviour, not framing.
+          events.push(frame.result ?? frame);
         }
       }
     }
@@ -370,10 +375,12 @@ test('a2a: push notifications are POSTed to the webhook on completion', async ()
     const id = body.result.id;
     const deadline = Date.now() + 12000;
     let finalEvent;
+    let attempt = 0;
     while (Date.now() < deadline) {
       finalEvent = mock.received.find((e) => e.kind === 'status-update' && e.final);
       if (finalEvent) break;
-      await new Promise((r) => setTimeout(r, 150));
+      await new Promise((r) => setTimeout(r, pollDelay(attempt)));
+      attempt += 1;
     }
     assert.ok(finalEvent, 'webhook received a final status-update');
     assert.equal(finalEvent.status.state, 'completed');
@@ -402,11 +409,18 @@ test('a2a: push webhook to a loopback host is rejected without allowlist (SSRF g
     }, { token: 'topsecret' });
     // Task still created; the webhook is simply not honoured.
     assert.ok(body.result?.id, 'task created despite rejected webhook');
-    const deadline = Date.now() + 6000;
+    // A push, if the guard were absent, fires synchronously on the first status
+    // change — long before the task settles. So driving the task to a terminal
+    // state and then watching a short grace window proves the webhook was
+    // dropped, without a blind 6s sleep (the mock would have been hit already).
+    // A push, if the guard were absent, fires on the first status change —
+    // within ~200ms of the task starting. 1.5s is a 7x margin, so a quiet mock
+    // is conclusive without the old 6s blind wait.
+    const deadline = Date.now() + 1500;
     let got = false;
     while (Date.now() < deadline) {
       if (mock.received.length > 0) { got = true; break; }
-      await new Promise((r) => setTimeout(r, 150));
+      await new Promise((r) => setTimeout(r, 30));
     }
     assert.equal(got, false, 'no push delivered to the loopback host');
   } finally {
@@ -623,13 +637,57 @@ test('a2a(P2): /healthz /metrics /version endpoints and message/send role guard'
 
 /* ---------------------------------------------------- Phase 3 #20: worktree cleanup on crash */
 
-/** Leftover worktree directories under stateDir/worktrees, if any. */
+/**
+ * Worktree directories still on disk, as `<instanceId>/<worktree>`.
+ *
+ * Layout since 0.4.2 is `<stateDir>/worktrees/<instanceId>/<worktree>/`, and the
+ * instance directory legitimately stays for the lifetime of the process — so
+ * counting entries of `worktrees/` would always be non-empty, and filtering by
+ * a `wb-` prefix (the pre-0.4.2 naming) would always be empty. Walk one level
+ * deeper instead, skipping the `owner.json` stamp.
+ */
 function leftoverWorktrees(stateDir) {
-  const dir = path.join(stateDir, 'worktrees');
+  const root = path.join(stateDir, 'worktrees');
+  const out = [];
+  let instances;
   try {
-    return fs.readdirSync(dir).filter((e) => e.startsWith('wb-'));
+    instances = readdirSync(root, { withFileTypes: true });
   } catch {
-    return [];
+    return out;
+  }
+  for (const inst of instances) {
+    if (!inst.isDirectory()) continue;
+    let entries;
+    try {
+      entries = readdirSync(path.join(root, inst.name), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) out.push(`${inst.name}/${e.name}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Poll until every worktree is reaped.
+ *
+ * Removal runs *after* the terminal state is published, and on Windows the
+ * agent's cwd handle is released asynchronously — the reaper retries up to
+ * ~1.8s. A fixed 300ms "beat" is therefore a race on Windows and slack on
+ * POSIX. Poll with a deadline: a directory that never goes away is still a
+ * real leak, so this fails loudly instead of masking it.
+ */
+async function waitNoLeftovers(stateDir, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  for (let attempt = 0; ; attempt += 1) {
+    const left = leftoverWorktrees(stateDir);
+    if (left.length === 0) return;
+    if (Date.now() > deadline) {
+      throw new Error(`worktrees were never reaped: ${JSON.stringify(left)}`);
+    }
+    await new Promise((r) => setTimeout(r, pollDelay(attempt)));
   }
 }
 
@@ -648,13 +706,7 @@ test('a2a(P3#20): a crashed agent does not leak its git worktree', async () => {
     const id = body.result.id;
     const done = await waitForTask(base, id, ['failed'], 8000);
     assert.equal(done.status.state, 'failed', 'crashed task is marked failed');
-    // Give the finally block a beat to remove the worktree.
-    await new Promise((r) => setTimeout(r, 300));
-    assert.deepEqual(
-      leftoverWorktrees(stateDir),
-      [],
-      'no worktree left behind after the agent crashed',
-    );
+    await waitNoLeftovers(stateDir);
   } finally {
     server.close();
     await rmSafe(stateDir);
@@ -676,6 +728,60 @@ test('a2a(P2#12): blocking message/send returns a settled task', async () => {
     assert.equal(status, 200);
     // A blocking call must not return a still-working task.
     assert.ok(['completed', 'failed'].includes(body.result.status.state), `got ${body.result.status.state}`);
+  } finally {
+    server.close();
+    await rmSafe(stateDir);
+    await rmSafe(repo);
+  }
+});
+
+test('a2a(P1): a blocking caller that disconnects must not cancel the task', async () => {
+  const repo = makeRepo();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbstate-a2a-drop-'));
+  const log = new Logger({ level: 'error', fileDir: stateDir });
+  const { mgr, server, base } = await startServer(makeConfig(repo, stateDir), log);
+  try {
+    const ac = new AbortController();
+    const pending = fetch(`${base}/a2a`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'message/send',
+        params: {
+          message: userMessage('MIDRUN take your time'),
+          configuration: { blocking: true },
+        },
+      }),
+      signal: ac.signal,
+    })
+      .then((r) => r.json())
+      .catch((err) => ({ aborted: true, name: err.name }));
+
+    // Let the request reach the blocking wait, then hang up like a closed tab.
+    await new Promise((r) => setTimeout(r, 300));
+    ac.abort();
+    const outcome = await pending;
+    assert.equal(outcome.aborted, true, 'the client-side call must have been aborted');
+
+    // A disconnect is not a cancel: the task must keep running.
+    const [job] = mgr.store.list({ limit: 1 });
+    assert.ok(job, 'the task must exist');
+    assert.equal(job.status, 'running', 'a disconnect must not cancel the work');
+
+    // The server must still serve, and must not mistake a dead socket for a
+    // reason to cancel the work. (Measured: Node silently swallows a write to a
+    // destroyed response, so this is a contract guard, not a crash repro.)
+    const card = await fetch(`${base}/.well-known/agent.json`);
+    assert.equal(card.status, 200);
+
+    // ...and the task finishes on its own.
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline && mgr.store.get(job.id).status === 'running') {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(mgr.store.get(job.id).status, 'completed');
   } finally {
     server.close();
     await rmSafe(stateDir);
@@ -781,7 +887,10 @@ test('a2a(P2#14): a JSON-RPC notification (no id) receives no response', async (
       method: 'message/send',
       params: { message: userMessage('a silent notification') },
     });
-    assert.equal(data.trim().length, 0, 'no response body for a notification');
+    // JSON-RPC: no *reply*. HTTP: the exchange still has to be terminated,
+    // otherwise the socket stays open. 202 + empty body satisfies both.
+    assert.match(data, /^HTTP\/1\.1 202/, 'notification must be acknowledged with 202');
+    assert.match(data, /\r\n\r\n\s*$/, 'and carry no body');
   } finally {
     server.close();
     await rmSafe(stateDir);
@@ -876,6 +985,65 @@ test('a2a(P2#15): CORS headers are absent when not configured', async () => {
       headers: { origin: 'http://evil.example.com' },
     });
     assert.equal(preflight.status, 405, 'no preflight support by default');
+  } finally {
+    server.close();
+    await rmSafe(stateDir);
+    await rmSafe(repo);
+  }
+});
+
+/* ------------------------------------------------- CORS credentials hardening */
+
+const corsProbe = (base, origin) =>
+  fetch(`${base}/a2a`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tasks/get', params: { id: 'nope' } }),
+  });
+
+test('a2a(CORS): a wildcard origin never grants credentials', async () => {
+  const repo = makeRepo();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbstate-cors-star-'));
+  const { server, base } = await startServer(
+    makeConfig(repo, stateDir, { a2aCorsOrigins: ['*'] }),
+    new Logger({ level: 'error', fileDir: stateDir }),
+  );
+  try {
+    // Reflecting an arbitrary origin while allowing credentials would let any
+    // website read authenticated bridge responses.
+    const res = await corsProbe(base, 'http://anywhere.example.com');
+    assert.equal(res.headers.get('access-control-allow-origin'), 'http://anywhere.example.com');
+    assert.equal(
+      res.headers.get('access-control-allow-credentials'),
+      null,
+      'a wildcard must not be paired with allow-credentials',
+    );
+    assert.match(res.headers.get('vary') ?? '', /origin/i, 'reflected origin must set Vary');
+  } finally {
+    server.close();
+    await rmSafe(stateDir);
+    await rmSafe(repo);
+  }
+});
+
+test('a2a(CORS): credentials are emitted only when explicitly enabled for an exact origin', async () => {
+  const repo = makeRepo();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbstate-cors-cred-'));
+  const { server, base } = await startServer(
+    makeConfig(repo, stateDir, {
+      a2aCorsOrigins: ['http://console.example.com'],
+      a2aCorsAllowCredentials: true,
+    }),
+    new Logger({ level: 'error', fileDir: stateDir }),
+  );
+  try {
+    const ok = await corsProbe(base, 'http://console.example.com');
+    assert.equal(ok.headers.get('access-control-allow-origin'), 'http://console.example.com');
+    assert.equal(ok.headers.get('access-control-allow-credentials'), 'true');
+
+    const denied = await corsProbe(base, 'http://evil.example.com');
+    assert.equal(denied.headers.get('access-control-allow-origin'), null);
+    assert.equal(denied.headers.get('access-control-allow-credentials'), null);
   } finally {
     server.close();
     await rmSafe(stateDir);

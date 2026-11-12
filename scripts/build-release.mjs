@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -198,7 +199,10 @@ async function main() {
     format: 'esm',
     minify: false,
     sourcemap: false,
-    legalComments: 'none',
+    // Keep third-party licence headers in the bundle: the payload embeds the
+    // MCP SDK and its transitive deps, and shipping it without their notices is
+    // a licence-compliance bug, not a size optimisation.
+    legalComments: 'eof',
     banner: {
       js: `// wb-cursor-bridge v${version} - bundled win-x64 build (node18+).`,
     },
@@ -217,11 +221,24 @@ async function main() {
   copyIntoStage('README.md', 'README.md');
   copyIntoStage('CHANGELOG.md', 'CHANGELOG.md');
   copyIntoStage('LICENSE', 'LICENSE');
-  fs.writeFileSync(
-    path.join(STAGE, 'VERSION'),
-    `${version}\n${new Date().toISOString()}\n`,
-    'utf8',
-  );
+  /**
+   * Build timestamp. A wall-clock stamp makes every rebuild produce a different
+   * archive, so nobody can verify that a published zip came from this source.
+   * `SOURCE_DATE_EPOCH` (the reproducible-builds convention) wins; otherwise we
+   * use the commit date, which changes only when the code does.
+   */
+  const sourceEpoch = Number.parseInt(process.env.SOURCE_DATE_EPOCH ?? '', 10);
+  let stampIso;
+  if (Number.isInteger(sourceEpoch) && sourceEpoch > 0) {
+    stampIso = new Date(sourceEpoch * 1000).toISOString();
+  } else {
+    const gitTime = spawnSync('git', ['log', '-1', '--format=%cI'], { cwd: ROOT, encoding: 'utf8' });
+    stampIso =
+      gitTime.status === 0 && gitTime.stdout.trim()
+        ? new Date(gitTime.stdout.trim()).toISOString()
+        : new Date(0).toISOString();
+  }
+  fs.writeFileSync(path.join(STAGE, 'VERSION'), `${version}\n${stampIso}\n`, 'utf8');
 
   // 3. Archive. The runtime directory is intentionally not included: the
   //    installer downloads it on demand so the payload stays small.
@@ -249,7 +266,6 @@ async function main() {
   }
 
   const zipFile = path.join(OUT, `${stageName}.zip`);
-  writeZip(entries, zipFile);
 
   // ------------------------------------------------------------- smoke test
   // Verify the bundled artifact can boot, load config, and pass its own
@@ -289,12 +305,33 @@ async function main() {
     );
   }
 
+  /**
+   * Checksums, and only then the archive. The smoke test now runs against the
+   * staged payload *before* anything is zipped, so a broken bundle can never
+   * produce a downloadable artefact; the manifest covers every payload file so
+   * an installer (or a suspicious user) can detect a tampered/corrupted
+   * extraction. The zip's own hash is written next to it.
+   */
+  const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
+  const manifest = entries
+    .map((e) => `${sha256(e.data)}  ${e.name.split('/').slice(1).join('/')}`)
+    .sort()
+    .join('\n');
+  const manifestBuf = Buffer.from(manifest + '\n', 'utf8');
+  entries.push({ name: `${stageName}/SHA256SUMS`, data: manifestBuf });
+  fs.writeFileSync(path.join(STAGE, 'SHA256SUMS'), manifestBuf, 'utf8');
+
+  writeZip(entries, zipFile);
+  const zipHash = sha256(fs.readFileSync(zipFile));
+  fs.writeFileSync(path.join(OUT, 'SHA256SUMS'), `${zipHash}  ${path.basename(zipFile)}\n`, 'utf8');
+
   const zipSize = fs.statSync(zipFile).size;
   const report = [
     `wb-cursor-bridge ${version}`,
     `  bundle      : ${(bundleBytes / 1024).toFixed(0)} KB (single file, zero runtime deps)`,
     `  payload     : ${entries.length} files`,
     `  archive     : ${zipFile} (${(zipSize / 1024).toFixed(0)} KB)`,
+    `  sha256      : ${zipHash}`,
     '',
     'Next: extract the zip on the target Windows machine and run install.ps1.',
     '',

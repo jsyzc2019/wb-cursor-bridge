@@ -11,15 +11,19 @@ import fs from 'node:fs';
 import { JobStore } from './store.js';
 import { runCursor, type RunOutcome } from './cursor/cli.js';
 import { assertWorkspaceAllowed } from './util/paths.js';
+import { reclaimOrphan } from './util/processes.js';
 import {
   createWorktree,
   captureDiff,
   changedFiles,
+  currentHead,
   diffStat,
   removeWorktree,
+  applyPatch,
   type Worktree,
 } from './util/git.js';
-import { concurrency, badArgument } from './errors.js';
+import { concurrency, badArgument, isolationFailed } from './errors.js';
+import { claimInstanceDir, currentInstanceId, worktreeRoot } from './util/instance.js';
 import type { Config } from './config.js';
 import type { Job, JobStatus, JobView, StartJobOptions, Tier } from './types.js';
 import type { Logger } from './logger.js';
@@ -54,6 +58,8 @@ export interface Metrics {
 
 export class JobManager {
   readonly store: JobStore;
+  /** Per-instance worktree container, so concurrent bridges sharing a stateDir never collide. */
+  readonly worktreeDir: string;
   private cfg: Config;
   private log: Logger;
   private inflight = new Map<string, AbortController>();
@@ -75,22 +81,71 @@ export class JobManager {
   constructor(cfg: Config, log: Logger) {
     this.cfg = cfg;
     this.log = log.child('jobs');
+    this.worktreeDir = this.resolveWorktreeDir();
     this.store = new JobStore(
       cfg.stateDir,
       {
         maxJobs: cfg.maxJobs,
         maxEventsPerJob: cfg.maxEventsPerJob,
+        maxEventBytes: cfg.maxEventBytes,
       },
       this.log.child('store'),
       cfg.eventLogDir,
+      currentInstanceId(),
     );
     const { orphaned } = this.store.load();
+    this.startTtlSweeper();
     this.metrics.orphanedOnBoot = orphaned.length;
     if (orphaned.length > 0) {
       this.log.warn('marked orphaned jobs from previous run', {
         count: orphaned.length,
         ids: orphaned.slice(0, 5),
       });
+      /**
+       * Reclaim the workers those jobs left behind. Marking a job "orphaned"
+       * only fixed the bookkeeping: the agent itself kept running, kept writing
+       * to a worktree nobody would ever collect, and nobody had its pid because
+       * it was never recorded. `reclaimOrphan` verifies /proc/<pid>/cmdline
+       * first, so a recycled pid belonging to someone else is never signalled.
+       */
+      for (const id of orphaned) {
+        const job = this.store.get(id);
+        if (!job?.pid) continue;
+        const childPid = job.pid;
+        void reclaimOrphan(childPid, cfg.cursorBin)
+          .then((outcome) => {
+            this.log.info('orphaned worker reclaim attempted', {
+              jobId: id,
+              pid: childPid,
+              ok: outcome.ok,
+              detail: outcome.detail,
+            });
+            if (outcome.ok) {
+              job.pid = undefined;
+              this.store.touch();
+            }
+          })
+          .catch((err) => this.log.warn('orphaned worker reclaim failed', { jobId: id, err: String(err) }));
+      }
+    }
+  }
+
+  /**
+   * Claim this instance's worktree container. Falls back to the legacy shared
+   * directory (with a warning) when the state directory is not writable:
+   * degrading isolation beats refusing to boot, and in that case worktrees
+   * cannot be created anyway.
+   */
+  private resolveWorktreeDir(): string {
+    try {
+      return claimInstanceDir(this.cfg.stateDir);
+    } catch (err) {
+      const fallback = worktreeRoot(this.cfg.stateDir);
+      this.log.warn('could not claim per-instance worktree directory; using shared layout', {
+        dir: fallback,
+        err: String((err as Error)?.message ?? err),
+      });
+      return fallback;
     }
   }
 
@@ -144,6 +199,20 @@ export class JobManager {
   }
 
   start(opts: StartJobOptions): Job {
+    /**
+     * Two different ceilings. `maxConcurrency` bounds work happening *now*;
+     * `maxLiveJobs` bounds tasks that still hold state (running + paused). The
+     * latter used to be unbounded: eight paused tasks with `maxJobs = 5` stayed
+     * resident forever, each with its own artefact directory and event log.
+     */
+    const liveLimit = Math.min(this.cfg.maxLiveJobs, this.cfg.maxJobs);
+    if (this.store.liveCount() >= liveLimit) {
+      this.metrics.rejected += 1;
+      throw concurrency(
+        `live job limit reached: ${this.store.liveCount()}/${liveLimit} tasks are still ` +
+          'running or awaiting input; cancel or finish some before starting new work',
+      );
+    }
     if (this.inflight.size >= this.cfg.maxConcurrency) {
       this.metrics.rejected += 1;
       throw concurrency(
@@ -228,27 +297,115 @@ export class JobManager {
     // the worktree itself so it can snapshot the diff before cleaning up.
     const needIsolation = this.cfg.forceWorktree || job.tier === 'execute';
     let worktree: Worktree | null = null;
+    /** Where inside the worktree the worker should run (subdir-aware). */
+    let isolatedWorkspace: string | undefined;
     if (needIsolation) {
       try {
-        worktree = await createWorktree(
-          job.workspace,
-          `wb-${job.id.slice(0, 8)}`,
-          path.join(this.cfg.stateDir, 'worktrees'),
-        );
-        // Only downgrade the intent recorded at dispatch time.
-        job.isolation = worktree ? 'bridge-worktree' : 'cursor-worktree';
+        /**
+         * Unique per attempt, not per job. A paused task is resumed while the
+         * previous pass may still be tearing its worktree down; a name derived
+         * only from the job id collided, `git worktree add` failed, and the
+         * bridge silently fell back to running `--force` in the caller's
+         * checkout. A time+random suffix makes every attempt a new directory.
+         */
+        const name = `wb-${job.id.slice(0, 8)}-${Date.now().toString(36)}-${randomUUID().slice(0, 4)}`;
+        const wt = await createWorktree(job.workspace, name, this.worktreeDir);
+        if (!wt) {
+          throw isolationFailed(
+            `workspace ${job.workspace} is not a git repository; an execute task cannot be ` +
+              `isolated in a worktree and will not be run in the caller's checkout`,
+          );
+        }
+        /**
+         * The caller may have picked a sub-directory of the repo. Running the
+         * agent at the worktree ROOT would give it the whole repository, which
+         * defeats a whitelist that names one directory. Map the same relative
+         * path inside the worktree and refuse anything that escapes it.
+         */
+        const rel = path.relative(wt.repo, job.workspace);
+        if (rel.startsWith('..') || path.isAbsolute(rel)) {
+          throw isolationFailed(`workspace ${job.workspace} is outside its repository root`);
+        }
+        isolatedWorkspace = rel ? path.join(wt.path, rel) : wt.path;
+        fs.mkdirSync(isolatedWorkspace, { recursive: true });
+        worktree = wt;
+        job.isolation = 'bridge-worktree';
       } catch (err) {
-        job.isolation = 'cursor-worktree';
-        this.log.warn('worktree creation failed, falling back to Cursor isolation', {
+        /**
+         * Fail closed. The old behaviour - warn and hand `--force` to Cursor at
+         * the caller's directory - turned every isolation problem into an
+         * uncontained write with no patch and no rollback. Refusing the task is
+         * the only honest outcome: the caller can then decide to commit their
+         * work, or ask for `tier: "consult"` which needs no isolation.
+         */
+        job.isolation = 'none';
+        this.log.error('isolation could not be established; refusing the task', {
           jobId: job.id,
           err: String(err),
         });
+        this.finalise(job, 'failed', {
+          exitCode: -1,
+          result:
+            'isolation required for an execute task could not be established, so the task was ' +
+            `refused rather than run in the caller's checkout: ${(err as Error).message}`,
+          durationMs: Date.now() - Date.parse(job.createdAt),
+        });
+        this.store.appendEvent(job, {
+          ts: new Date().toISOString(),
+          type: 'note',
+          text: 'task refused: no worktree isolation available',
+        });
+        await this.store.flushNow();
+        return;
       }
     } else {
       job.isolation = 'none';
     }
 
-    const runWorkspace = worktree ? worktree.path : job.workspace;
+    // --- resume continuity ---------------------------------------------------
+    // A paused task's worktree was removed when the previous pass ended, so this
+    // pass starts from a clean HEAD. Re-apply the patch captured before the
+    // pause; otherwise the files the worker already wrote vanish and the resumed
+    // thread talks about a tree that no longer exists.
+    //
+    // Fail closed: if the saved work cannot be restored (the base moved, the
+    // patch was pruned), drop back to `input-required` with an explicit event
+    // instead of running the worker on a tree missing its own earlier output.
+    if (worktree && job.patchFile) {
+      const restored = await applyPatch(worktree.path, job.patchFile);
+      if (!restored.ok) {
+        this.log.error('failed to restore paused worktree changes', {
+          jobId: job.id,
+          patchFile: job.patchFile,
+          reason: restored.reason,
+        });
+        job.status = 'input-required';
+        job.inputRequiredAt = job.inputRequiredAt ?? new Date().toISOString();
+        this.inflight.delete(job.id);
+        this.store.appendEvent(job, {
+          ts: new Date().toISOString(),
+          type: 'note',
+          text:
+            'resume blocked: the changes saved before the pause could not be restored ' +
+            `(${restored.reason}); the task is still input-required and the saved patch is intact`,
+        });
+        this.store.touch();
+        await this.store.flushNow();
+        return;
+      }
+      this.store.appendEvent(job, {
+        ts: new Date().toISOString(),
+        type: 'note',
+        text: `restored ${job.changedFiles?.length ?? 0} changed file(s) saved before the pause`,
+      });
+    }
+
+    // From here on the task is genuinely executing: the open question no longer
+    // describes its state. Cleared late so a failed restore can keep it.
+    job.pendingInput = undefined;
+    job.inputRequiredAt = undefined;
+
+    const runWorkspace = isolatedWorkspace ?? job.workspace;
 
     // The whole run — including the worktree-dependent artefact capture — lives
     // inside one try, and the worktree is torn down in the `finally`. This is
@@ -283,6 +440,12 @@ export class JobManager {
             job.threadId = id;
             this.store.touch();
           },
+          onSpawn: (childPid) => {
+            job.pid = childPid;
+            // Persist immediately: the window we care about is a crash in the
+            // next few seconds, before any timer would fire.
+            this.store.persist();
+          },
         },
         controller.signal,
       );
@@ -290,11 +453,15 @@ export class JobManager {
       // --- artefact capture, before the worktree is removed ------------------
       if (worktree) {
         try {
-          job.changedFiles = await changedFiles(worktree.path);
-          job.diffStat = await diffStat(worktree.path);
+          // Anchor every artefact to the commit the worktree was created from,
+          // so work the agent COMMITTED itself is part of the deliverables.
+          const base = worktree.head;
+          job.changedFiles = await changedFiles(worktree.path, base);
+          job.diffStat = await diffStat(worktree.path, base);
           const patch = await captureDiff(
             worktree.path,
             path.join(this.artifactsDir(job.id), 'changes.patch'),
+            base,
           );
           if (patch) {
             job.patchFile = patch.file;
@@ -304,10 +471,24 @@ export class JobManager {
               text: `patch captured (${patch.bytes} bytes)`,
             });
           }
-          if (job.result) {
+          if (worktree.head !== (await currentHead(worktree.path))) {
+            // Useful signal for the caller: a commit was made, and the patch
+            // above is what carries it out of the worktree.
+            this.store.appendEvent(job, {
+              ts: new Date().toISOString(),
+              type: 'note',
+              text: 'the worker committed inside its worktree; the patch includes those commits',
+            });
+          }
+          /**
+           * The report is written from the RUN's result, not from `job.result`:
+           * at this point `finalise()` has not run yet, so `job.result` is still
+           * undefined and every fresh task ended up with no report at all.
+           */
+          if (outcome.result) {
             const report = path.join(this.artifactsDir(job.id), 'report.md');
             fs.mkdirSync(path.dirname(report), { recursive: true });
-            fs.writeFileSync(report, job.result, 'utf8');
+            fs.writeFileSync(report, outcome.result, 'utf8');
             job.reportFile = report;
           }
         } catch (err) {
@@ -365,6 +546,9 @@ export class JobManager {
     job.inputRequiredAt = new Date().toISOString();
     if (outcome.result) job.result = outcome.result;
     if (outcome.threadId) job.threadId = outcome.threadId;
+    // A paused task must not silently drop the truncation flag: a caller that
+    // sees a short result has to know it was capped rather than complete.
+    job.truncated = job.truncated || outcome.truncated || false;
     job.durationMs = outcome.durationMs;
     this.inflight.delete(job.id);
     this.store.appendEvent(job, {
@@ -372,6 +556,7 @@ export class JobManager {
       type: 'note',
       text: `input-required: ${outcome.needInput}`,
     });
+    this.store.evictNow();
     this.store.touch();
     void this.store.flushNow();
     this.log.info('job paused for input', { jobId: job.id, pendingInput: outcome.needInput });
@@ -392,9 +577,33 @@ export class JobManager {
         `task ${job.id} is in state '${job.status}', not 'input-required'; cannot resume`,
       );
     }
+    // The tier is fixed when the task is created. Silently accepting a different
+    // tier here would let a caller believe it downgraded (or upgraded) a task
+    // that keeps running under its original permissions.
+    if (tier && tier !== job.tier) {
+      throw badArgument(
+        `task ${job.id} was created with tier '${job.tier}'; an input-required resume cannot ` +
+          `change it to '${tier}' - start a new task instead`,
+      );
+    }
+    /**
+     * Resuming is another way to start work, so it must pay the same admission
+     * fee as start(). It used to bypass the check entirely: with
+     * `maxConcurrency = 1` a caller could pause A, start B, then reply to A and
+     * end up with `active = 2`. The check runs before any mutation, so a
+     * rejected reply leaves the task exactly where it was: input-required.
+     */
+    if (this.inflight.size >= this.cfg.maxConcurrency) {
+      this.metrics.rejected += 1;
+      throw concurrency(
+        `concurrency limit reached: ${this.inflight.size}/${this.cfg.maxConcurrency} running jobs; ` +
+          `task ${job.id} stays input-required, retry later`,
+      );
+    }
     job.status = 'running';
-    job.pendingInput = undefined;
-    job.inputRequiredAt = undefined;
+    // Keep `pendingInput` until execute() actually gets past the worktree
+    // restore: if that restore fails the task drops back to input-required and
+    // the caller must still see the original question.
     this.store.appendEvent(job, {
       ts: new Date().toISOString(),
       type: 'input',
@@ -451,6 +660,10 @@ export class JobManager {
     else if (status === 'cancelled') this.metrics.cancelled += 1;
     else if (status === 'timeout') this.metrics.timedOut += 1;
 
+    // A finished job can push the store over `maxJobs`; eviction is what
+    // deletes its artefacts and event log, so it has to run on this edge and
+    // not only when a NEW job is created.
+    this.store.evictNow();
     this.store.appendEvent(job, {
       ts: new Date().toISOString(),
       type: 'end',
@@ -528,11 +741,65 @@ export class JobManager {
     });
   }
 
+  /**
+   * Expire tasks that have been waiting for caller input past the configured
+   * TTL, releasing their state and their artefact directory.
+   *
+   * Without this, `input-required` is a one-way door: the caller may never
+   * answer, and the task (plus its patch) sits in the store and on disk forever.
+   */
+  private startTtlSweeper(): void {
+    const configured = this.cfg.inputRequiredTtlSec;
+    // Never degrade to "expire everything": a missing/invalid value means the
+    // sweeper is simply not armed.
+    const ttlMs = Number.isFinite(configured) && configured > 0 ? configured * 1000 : 0;
+    if (ttlMs === 0) return;
+    const tick = Math.min(60_000, Math.max(5_000, Math.floor(ttlMs / 4)));
+    const timer = setInterval(() => {
+      const now = Date.now();
+      for (const job of this.store.list({ limit: 10_000 })) {
+        if (job.status !== 'input-required' || !job.inputRequiredAt) continue;
+        const pausedFor = now - Date.parse(job.inputRequiredAt);
+        if (!Number.isFinite(pausedFor) || pausedFor < ttlMs) continue;
+        job.status = 'cancelled';
+        job.finishedAt = new Date().toISOString();
+        job.pendingInput = undefined;
+        this.store.appendEvent(job, {
+          ts: new Date().toISOString(),
+          type: 'end',
+          text: `input-required expired after ${Math.round(pausedFor / 1000)}s`,
+        });
+        this.store.discardFiles(job.id);
+        this.log.info('expired input-required task', { jobId: job.id, pausedFor });
+      }
+      this.store.touch();
+    }, tick);
+    timer.unref?.();
+  }
+
   /** Cancel everything in flight; used on shutdown. */
   async shutdown(graceMs = 8000): Promise<void> {
+    /**
+     * Never trust the caller's grace. `0` used to exit before the kill signal
+     * had landed (the agent survived the bridge), and `Infinity` made the wait
+     * loop below spin forever, so `flushNow()` and `process.exit` were never
+     * reached. Clamp into a range where "cancel then persist" can actually
+     * complete.
+     */
+    /**
+     * Lower bound is 3s, not 0: `cancel` only *requests* an abort, and the run
+     * settles ~2s later (drain window + kill). Exiting at 100ms left the agent
+     * alive - the caller believed the bridge had stopped the work it abandoned.
+     * `cancel` on a paused task is instant, so this bound only affects running
+     * work, which is exactly the case that must not be abandoned.
+     */
+    const grace = Number.isFinite(graceMs) ? Math.min(Math.max(graceMs, 3000), 60_000) : 8000;
     const ids = [...this.inflight.keys()];
-    if (ids.length === 0) return;
-    this.log.info('cancelling in-flight jobs on shutdown', { count: ids.length });
+    if (ids.length === 0) {
+      await this.store.flushNow();
+      return;
+    }
+    this.log.info('cancelling in-flight jobs on shutdown', { count: ids.length, graceMs: grace });
     for (const id of ids) {
       try {
         this.cancel(id);
@@ -540,9 +807,14 @@ export class JobManager {
         /* ignore */
       }
     }
-    const deadline = Date.now() + graceMs;
+    const deadline = Date.now() + grace;
     while (this.inflight.size > 0 && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 100));
+    }
+    if (this.inflight.size > 0) {
+      this.log.warn('shutdown grace expired with jobs still in flight', {
+        remaining: this.inflight.size,
+      });
     }
     await this.store.flushNow();
   }

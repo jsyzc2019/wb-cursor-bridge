@@ -24,7 +24,8 @@ import { createDispatcher, TOOL_DEFINITIONS } from './tools.js';
 import { startAdminServer } from './admin.js';
 import { startA2AServer } from './a2a/server.js';
 import { BridgeError } from './errors.js';
-import { pruneOwnedWorktrees } from './util/git.js';
+import { pruneWorktreeMetadata } from './util/git.js';
+import { pruneStaleInstanceDirs } from './util/instance.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -200,22 +201,42 @@ async function main(): Promise<void> {
   });
 
   // Best-effort cleanup of worktrees left behind by a previous crash.
-  if (config.workspaceRoots.length > 0) {
-    void (async () => {
+  //
+  // Only directories whose owning instance is verifiably gone are reclaimed.
+  // Every MCP session spawns its own bridge and they all resolve the same
+  // default state directory, so reclaiming the container wholesale would delete
+  // the checkouts a sibling bridge is currently running inside.
+  void (async () => {
+    try {
+      const { removed, peers, unknown } = pruneStaleInstanceDirs(config.stateDir);
+      if (removed.length > 0) {
+        log.info('reclaimed worktrees from exited instances', { count: removed.length });
+      }
+      if (unknown.length > 0) {
+        log.warn('left unattributed worktree directories in place', {
+          count: unknown.length,
+          hint: 'they will be reclaimed once older than the staleness threshold',
+        });
+      }
+      if (peers.length > 0) {
+        // The job index is a single file; two live instances writing it will
+        // overwrite each other's history. Worktrees are safe now, history is not.
+        log.warn('another bridge instance shares this state directory', {
+          peers: peers.map((p) => ({ pid: p.pid, instanceId: p.instanceId })),
+          hint: 'set a distinct CURSOR_BRIDGE_STATE_DIR per instance to isolate job history',
+        });
+      }
       for (const root of config.workspaceRoots) {
         try {
-          if (fs.existsSync(root)) {
-            await pruneOwnedWorktrees(
-              root,
-              path.join(config.stateDir, 'worktrees'),
-            );
-          }
+          if (fs.existsSync(root)) await pruneWorktreeMetadata(root);
         } catch {
           /* best effort */
         }
       }
-    })();
-  }
+    } catch {
+      /* best effort */
+    }
+  })();
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

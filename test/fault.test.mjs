@@ -7,16 +7,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { createClient, waitFor } from './client.mjs';
+import { fakeBin } from './fake-bin.mjs';
+import { rmrf } from './tmp.mjs';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const FAKE = process.platform === 'win32'
-  ? path.join(ROOT, 'test', 'fake-agent.cmd')
-  : path.join(ROOT, 'test', 'fake-agent.sh');
+const FAKE = fakeBin('cursor');
 
 function makeRepo() {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'wbrepo-'));
@@ -60,8 +58,8 @@ test('fault: bridge survives a stateDir path occupied by a file', async () => {
     assert.equal(health.data.stateDirWritable, false);
   } finally {
     await client.close();
-    rmSync(blocked, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
+    rmrf(blocked);
+    rmrf(repo);
   }
 });
 
@@ -86,7 +84,7 @@ test('fault: eventLogDir occupied by a file does not break the job', async () =>
     assert.ok(existsSync(eventLogDir));
   } finally {
     await client.close();
-    rmSync(stateDir, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });

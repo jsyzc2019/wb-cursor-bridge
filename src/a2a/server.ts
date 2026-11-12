@@ -13,12 +13,16 @@
  */
 import http from 'node:http';
 import fs from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { pipeline } from 'node:stream';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
+import dns from 'node:dns/promises';
+import { privateAddressReason } from '../util/net.js';
 import type { JobManager } from '../runner.js';
 import type { Config } from '../config.js';
 import type { Logger } from '../logger.js';
 import type { Job, Tier } from '../types.js';
-import { badArgument, concurrency, notFound } from '../errors.js';
+import { badArgument, notFound } from '../errors.js';
 import { buildAgentCard, AGENT_OUTPUT_MODES } from './card.js';
 import { toV1Card, isV1, type A2AVersion } from './compat.js';
 import { deriveSkills, resolveRoot, type SkillEntry } from './skills.js';
@@ -53,26 +57,46 @@ const PROVIDER = { organization: 'WorkBuddy', url: 'https://www.workbuddy.cn' };
  */
 const A2A_RATE_LIMIT_REFILL = 250; // tokens replenished per second
 
-/** Fixed-capacity token bucket. `take()` returns false once drained. */
-class TokenBucket {
-  private tokens: number;
-  private last = Date.now();
+/**
+ * Per-client token bucket.
+ *
+ * A single shared bucket is not a rate limit, it is a global lock: one caller
+ * draining it makes every other client 429 until it refills. Keying by peer
+ * address means a noisy neighbour only starves itself. Buckets are swept once
+ * the map grows large, so a spoofed-source flood cannot grow memory unbounded.
+ */
+class PerClientRateLimiter {
+  private buckets = new Map<string, { tokens: number; last: number; seen: number }>();
+  private readonly capacity: number;
   constructor(
-    private readonly capacity: number,
-    private readonly refillPerSec: number,
+    private readonly ratePerSec: number,
+    capacity = 0,
   ) {
-    this.tokens = capacity;
+    this.capacity = Math.max(1, capacity || ratePerSec);
   }
-  take(n = 1): boolean {
+  take(key: string, n = 1): boolean {
     const now = Date.now();
-    const dt = (now - this.last) / 1000;
-    this.last = now;
-    this.tokens = Math.min(this.capacity, this.tokens + dt * this.refillPerSec);
-    if (this.tokens >= n) {
-      this.tokens -= n;
+    let b = this.buckets.get(key);
+    if (!b) {
+      b = { tokens: this.capacity, last: now, seen: now };
+      this.buckets.set(key, b);
+    }
+    const dt = (now - b.last) / 1000;
+    b.last = now;
+    b.seen = now;
+    b.tokens = Math.min(this.capacity, b.tokens + dt * this.ratePerSec);
+    if (b.tokens >= n) {
+      b.tokens -= n;
+      this.sweep(now);
       return true;
     }
     return false;
+  }
+  private sweep(now: number): void {
+    if (this.buckets.size < 2048) return;
+    for (const [key, b] of this.buckets) {
+      if (now - b.seen > 600_000) this.buckets.delete(key);
+    }
   }
 }
 
@@ -142,14 +166,36 @@ export function startA2AServer(
 
   let actualPort = config.a2aPort;
   const ratePerSec = config.a2aRateLimitPerSec ?? A2A_RATE_LIMIT_REFILL;
-  const rateLimit = new TokenBucket(ratePerSec, ratePerSec);
+  const rateLimit = new PerClientRateLimiter(ratePerSec);
 
   const server = http.createServer((req, res) => {
+    // Defence in depth: a synchronous throw anywhere below (e.g. a malformed
+    // URI reaching decodeURIComponent) must never escape this listener - an
+    // uncaught throw becomes an uncaughtException and shuts the whole bridge
+    // down, turning one bad request into a remote DoS. Catch, log, and answer
+    // 500 instead.
+    try {
     const url = (req.url ?? '/').split('?')[0];
 
     // When CORS origins are configured (opt-in), reflect the requesting origin
     // on every response so a browser-based console can talk to the bridge.
     applyCors(req, res, config);
+
+    /**
+     * One gate for every dynamic route, GET included: a per-IP bucket limits a
+     * single abuser without letting them starve everybody else. Discovery
+     * (`/.well-known/agent.json`) is exempt so probes and load balancers can
+     * always read the card.
+     */
+    const isDiscovery = url === '/.well-known/agent.json' || url === '/.well-known/agent-card.json';
+    if (!isDiscovery) {
+      const clientKey = req.socket.remoteAddress ?? 'unknown';
+      if (!rateLimit.take(clientKey)) {
+        res.setHeader('retry-after', '1');
+        sendJson(res, 429, rpcError(A2A_ERROR.RATE_LIMITED, 'rate limit exceeded; retry later'));
+        return;
+      }
+    }
 
     if (req.method === 'GET' && (url === '/.well-known/agent.json' || url === '/.well-known/agent-card.json')) {
       if (!card) {
@@ -185,13 +231,21 @@ export function startA2AServer(
     }
 
     if (url === '/a2a' && req.method === 'POST') {
-      // Token-bucket gate: a drained bucket returns 429 rather than letting a
-      // flood of requests pile up against maxConcurrency or an SSRF pivot loop.
-      if (!rateLimit.take(1)) {
-        sendJson(res, 429, rpcError(A2A_ERROR.RATE_LIMITED, 'rate limit exceeded; retry later'));
-        return;
-      }
-      return handlePost(mgr, skills, config, log, req, res, artifactBaseUrl);
+      /**
+       * `handlePost` is async; returning its promise from this synchronous
+       * listener means a rejection never reaches the surrounding try/catch.
+       * Attach the handler here so no single request can escalate into a
+       * process-level unhandledRejection.
+       */
+      void handlePost(mgr, skills, config, log, req, res, artifactBaseUrl).catch((err) => {
+        log.error('a2a request failed', { err: err instanceof Error ? err.stack : String(err) });
+        if (!res.headersSent) {
+          sendJson(res, 500, rpcError(A2A_ERROR.INTERNAL_ERROR, 'internal error'));
+        } else if (!res.writableEnded) {
+          res.destroy();
+        }
+      });
+      return;
     }
 
     // Artifact fetch endpoint: serves captured patch / report files so a remote
@@ -214,7 +268,18 @@ export function startA2AServer(
         sendJson(res, 401, rpcError(A2A_ERROR.AUTH_REQUIRED, 'unauthorized'));
         return;
       }
-      return sendJson(res, 200, { ok: true, status: 'healthy' });
+      /**
+       * A hard-coded `{ok:true}` is worse than no health check: an orchestrator
+       * keeps routing work to a bridge whose cursor binary is missing. Report
+       * the real health, and use 503 so a probe can act on it.
+       */
+      const health = mgr.health() as { ok?: boolean; issues?: string[] };
+      const ok = health.ok !== false;
+      return sendJson(res, ok ? 200 : 503, {
+        ok,
+        status: ok ? 'healthy' : 'degraded',
+        issues: health.issues ?? [],
+      });
     }
     if (url === '/metrics' && req.method === 'GET') {
       if (!authOk(req, config.a2aAuthToken)) {
@@ -236,7 +301,29 @@ export function startA2AServer(
       agentCard: '/.well-known/agent.json',
       rpc: 'POST /a2a',
     });
+    } catch (err) {
+      log.error('a2a request handler error', {
+        err: err instanceof Error ? err.stack : String(err),
+      });
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: 'internal error' });
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    }
   });
+
+  /**
+   * Node's defaults (60s headers / no request timeout) let one client hold
+   * thousands of half-open connections: a slowloris never finishes the header
+   * block, so the request handler is never reached and the rate limiter never
+   * sees it. These limits apply to READING the request, so long-lived SSE
+   * responses are unaffected.
+   */
+  server.headersTimeout = 10_000;
+  server.requestTimeout = 60_000;
+  server.keepAliveTimeout = 5_000;
+  server.maxConnections = 512;
 
   server.on('error', (err) => {
     log.error('a2a server failed', { err: String(err) });
@@ -276,24 +363,42 @@ function applyCors(req: http.IncomingMessage, res: http.ServerResponse, config: 
   if (!origins || origins.length === 0) return;
   const origin = req.headers['origin'];
   if (!origin || typeof origin !== 'string') return;
-  if (origins.includes('*') || origins.includes(origin)) {
-    // Reflect the specific origin (never '*') so credentials remain permitted.
-    res.setHeader('access-control-allow-origin', origin);
+  const wildcard = origins.includes('*');
+  if (!wildcard && !origins.includes(origin)) return;
+  // Reflect the specific origin (never '*') so that per-origin Vary caching
+  // stays meaningful.
+  res.setHeader('access-control-allow-origin', origin);
+  // `allow-credentials` on a reflected origin means the browser will attach
+  // cookies/authorization to cross-origin calls and let the calling script read
+  // the response - for *every* origin when the list is a wildcard. It is
+  // therefore opt-in only, and config load rejects the wildcard combo outright.
+  if (config.a2aCorsAllowCredentials) {
     res.setHeader('access-control-allow-credentials', 'true');
-    res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
-    res.setHeader('access-control-allow-headers', 'content-type,authorization,x-a2a-token');
-    res.setHeader('access-control-max-age', '600');
   }
+  // The body of the response now varies by request Origin; without this a
+  // shared cache can serve one origin's response to another.
+  res.setHeader('vary', 'origin');
+  res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
+  res.setHeader('access-control-allow-headers', 'content-type,authorization,x-a2a-token');
+  res.setHeader('access-control-max-age', '600');
 }
 
 function sendJson(res: http.ServerResponse, code: number, body: unknown): void {
+  // A blocking caller may have disconnected while we held its request open.
+  // Writing to a destroyed response is at best wasted work; guard so the bridge
+  // never depends on the runtime quietly swallowing it.
+  if (res.writableEnded || res.destroyed) return;
   const payload = JSON.stringify(body);
-  res.writeHead(code, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(payload),
-    'cache-control': 'no-store',
-  });
-  res.end(payload);
+  try {
+    res.writeHead(code, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': Buffer.byteLength(payload),
+      'cache-control': 'no-store',
+    });
+    res.end(payload);
+  } catch {
+    /* client vanished between the check and the write */
+  }
 }
 
 function sendJsonRpc(res: http.ServerResponse, id: string | number | null, body: Partial<JsonRpcResponse>): void {
@@ -326,12 +431,31 @@ async function readBody(req: http.IncomingMessage): Promise<Buffer> {
   });
 }
 
+/** Constant-time string comparison for secrets (guards against timing oracles). */
+function safeEqual(a: string, b: string): boolean {
+  /**
+   * Hash both sides to a fixed 32 bytes before comparing. The earlier version
+   * compared lengths first, which leaks the secret's length and (measured) made
+   * an early mismatch ~7x faster than a late one - a usable oracle for
+   * recovering a token byte by byte over a long-lived connection.
+   */
+  const ab = createHash('sha256').update(a, 'utf8').digest();
+  const bb = createHash('sha256').update(b, 'utf8').digest();
+  return timingSafeEqual(ab, bb);
+}
+
 function authOk(req: http.IncomingMessage, token?: string): boolean {
   if (!token) return true;
   const header = req.headers['authorization'];
   const direct = req.headers['x-a2a-token'];
   const bearer = typeof header === 'string' ? header.replace(/^Bearer\s+/i, '') : undefined;
-  return bearer === token || direct === token;
+  const directStr = typeof direct === 'string' ? direct : undefined;
+  // Compare in constant time so a caller cannot recover the token byte-by-byte
+  // from response timing on a long-lived, network-reachable endpoint.
+  return (
+    (bearer !== undefined && safeEqual(bearer, token)) ||
+    (directStr !== undefined && safeEqual(directStr, token))
+  );
 }
 
 async function handlePost(
@@ -358,13 +482,39 @@ async function handlePost(
 
   let parsed: JsonRpcRequest;
   try {
-    parsed = JSON.parse(raw.toString('utf8')) as JsonRpcRequest;
+    const decoded: unknown = JSON.parse(raw.toString('utf8'));
+    /**
+     * Shape guard before touching a single field. `JSON.parse('null')` is a
+     * perfectly valid parse whose value is `null`, and `parsed.id` then throws
+     * a TypeError inside an async handler. That rejection escaped the sync
+     * try/catch around the request listener, counted against the
+     * unhandledRejection budget, and 20 four-byte POSTs killed the process.
+     * Arrays and primitives are equally invalid as a JSON-RPC *request object*.
+     */
+    if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded)) {
+      sendJson(res, 200, {
+        jsonrpc: JsonRpcVersion,
+        id: null,
+        ...rpcError(A2A_ERROR.INVALID_REQUEST, 'invalid JSON-RPC 2.0 request'),
+      });
+      return;
+    }
+    parsed = decoded as JsonRpcRequest;
   } catch {
     sendJson(res, 200, { jsonrpc: JsonRpcVersion, id: null, ...rpcError(A2A_ERROR.PARSE_ERROR, 'parse error') });
     return;
   }
 
-  const id = parsed.id ?? null;
+  const rawId: unknown = parsed.id;
+  if (rawId !== undefined && rawId !== null && typeof rawId !== 'string' && typeof rawId !== 'number') {
+    sendJson(res, 200, {
+      jsonrpc: JsonRpcVersion,
+      id: null,
+      ...rpcError(A2A_ERROR.INVALID_REQUEST, 'id must be a string, number or null'),
+    });
+    return;
+  }
+  const id = (rawId ?? null) as string | number | null;
   if (parsed.jsonrpc !== '2.0' || typeof parsed.method !== 'string') {
     sendJsonRpc(res, id, rpcError(A2A_ERROR.INVALID_REQUEST, 'invalid JSON-RPC 2.0 request'));
     return;
@@ -379,32 +529,63 @@ async function handlePost(
   // Streaming methods speak SSE rather than a single JSON response.
   const isStream = parsed.method === 'message/stream' || parsed.method === 'tasks/resubscribe';
   if (isStream) {
-    if (isNotification) return;
+    if (isNotification) {
+      // JSON-RPC says "do not reply", but HTTP still needs a terminated
+      // response: returning without ending the socket left the connection open
+      // until the client gave up.
+      res.writeHead(202, { 'content-length': '0' });
+      res.end();
+      return;
+    }
     return handleStream(mgr, skills, config, log, parsed, req, res, artifactBase);
   }
 
   if (isNotification) {
-    // Best-effort side effect, no wire response.
+    // Best-effort side effect, no JSON-RPC reply - but still an HTTP reply.
     await dispatch(mgr, skills, config, log, parsed, artifactBase).catch((err) =>
       log.warn('a2a notification error', { method: parsed.method, err: String((err as Error)?.message) }),
     );
+    if (!res.writableEnded) {
+      res.writeHead(202, { 'content-length': '0' });
+      res.end();
+    }
     return;
   }
 
+  // A blocking `message/send` can hold this connection for up to
+  // `a2aBlockingMaxMs`. If the client hangs up we stop waiting (freeing the
+  // request) but never cancel the task itself: the work is still wanted and a
+  // caller may reconnect and poll / resubscribe.
+  const disconnect = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) disconnect.abort();
+  };
+  res.once('close', onClose);
+
   try {
-    const result = await dispatch(mgr, skills, config, log, parsed, artifactBase);
+    const result = await dispatch(mgr, skills, config, log, parsed, artifactBase, disconnect.signal);
+    if (disconnect.signal.aborted) {
+      log.info('a2a client disconnected during a blocking call; task keeps running', {
+        method: parsed.method,
+      });
+      return;
+    }
     sendJsonRpc(res, id, { result });
   } catch (err) {
     const code = a2aErrorCode(err);
     log.warn('a2a rpc error', { method: parsed.method, code, message: String((err as Error)?.message) });
     sendJsonRpc(res, id, rpcError(code, (err as Error)?.message ?? 'internal error'));
+  } finally {
+    res.off('close', onClose);
   }
 }
 
 function a2aErrorCode(err: unknown): number {
   const code = (err as { code?: string })?.code;
   if (code === 'E_NOT_FOUND') return A2A_ERROR.TASK_NOT_FOUND;
-  if (code === 'E_CONCURRENCY') return A2A_ERROR.INTERNAL_ERROR;
+  // Capacity is a retryable condition with its own code, not an internal bug:
+  // a client that sees -32603 has no way to know it should back off and retry.
+  if (code === 'E_CONCURRENCY') return A2A_ERROR.TASK_REJECTED;
   if (code === 'E_BAD_ARGUMENT') return A2A_ERROR.INVALID_PARAMS;
   if (code === 'E_PATH_DENIED') return A2A_ERROR.INVALID_PARAMS;
   if (code === 'E_METHOD_NOT_FOUND') return A2A_ERROR.METHOD_NOT_FOUND;
@@ -423,6 +604,7 @@ async function dispatch(
   log: Logger,
   req: JsonRpcRequest,
   artifactBase: () => string,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const params = (req.params ?? {}) as Record<string, unknown>;
   const a2aVersion = config.a2aProtocolVersion ?? '0.3.0';
@@ -452,7 +634,12 @@ async function dispatch(
       // task without a second round-trip. The cap prevents a long-running job
       // from pinning the HTTP connection indefinitely.
       if (configuration?.blocking) {
-        const final = await awaitBlockingFinal(mgr, job.id, config.a2aBlockingMaxMs ?? 90_000);
+        const final = await awaitBlockingFinal(
+          mgr,
+          job.id,
+          config.a2aBlockingMaxMs ?? 90_000,
+          signal,
+        );
         return toTask(final, taskOpts);
       }
       return toTask(job, taskOpts);
@@ -578,14 +765,76 @@ function maybePush(
     });
     return;
   }
-  const blocked = unsafePushUrl(push.url, config.a2aPushUrlAllowlist);
-  if (blocked) {
-    log.warn('push notification url rejected', { taskId: job.id, url: push.url, reason: blocked });
-    return;
+  void verifyPushTarget(push.url, config.a2aPushUrlAllowlist)
+    .then((blocked) => {
+      if (blocked) {
+        // Never log the raw URL: it can carry a secret in the query string.
+        log.warn('push notification url rejected', {
+          taskId: job.id,
+          url: safeUrlForLog(push.url),
+          reason: blocked,
+        });
+        return;
+      }
+      return watchAndPush(mgr, job.id, push, log.child('push'), signal);
+    })
+    .catch((err) => log.warn('push watcher error', { taskId: job.id, err: String(err) }));
+}
+
+/** Origin + path only: query strings routinely carry webhook secrets. */
+export function safeUrlForLog(raw: string): string {
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return '<unparseable url>';
   }
-  void watchAndPush(mgr, job.id, push, log.child('push'), signal).catch((err) =>
-    log.warn('push watcher error', { taskId: job.id, err: String(err) }),
-  );
+}
+
+/**
+ * Full SSRF gate: string-level classification PLUS a DNS resolution check.
+ *
+ * `unsafePushUrl` only inspects the literal host, so `https://attacker.example`
+ * that resolves to 10.0.0.5 walked straight through. We now resolve every
+ * address the name maps to and reject the target unless ALL of them are public.
+ * Combined with `redirect: 'manual'` at send time this closes the practical
+ * pivot; a determined rebinding attack (TTL 0, second resolution at connect)
+ * still needs connection pinning, which is documented as a residual risk.
+ */
+export async function verifyPushTarget(url: string, allowlist?: string[]): Promise<string | null> {
+  const blocked = unsafePushUrl(url, allowlist);
+  if (blocked) return blocked;
+
+  const u = new URL(url);
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (isIP(host)) return null; // already classified by unsafePushUrl
+  if (isAllowlisted(u, allowlist)) return null;
+
+  let addrs: { address: string }[];
+  try {
+    addrs = await dns.lookup(host, { all: true, verbatim: true });
+  } catch {
+    return `push target "${host}" could not be resolved`;
+  }
+  if (addrs.length === 0) return `push target "${host}" has no addresses`;
+  for (const a of addrs) {
+    const literal = a.address.includes(':') ? `[${a.address}]` : a.address;
+    const probe = unsafePushUrl(`${u.protocol}//${literal}/`);
+    if (probe) return `push target "${host}" resolves to a blocked address ${a.address}`;
+  }
+  return null;
+}
+
+/** Allowlist entries may be a bare host, host:port, or scheme://host:port. */
+function isAllowlisted(u: URL, allowlist?: string[]): boolean {
+  if (!allowlist || allowlist.length === 0) return false;
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  return allowlist.some((entry) => {
+    const e = entry.trim();
+    if (!e) return false;
+    if (e === host || e === u.hostname || e === u.host) return true;
+    return e === `${u.protocol}//${u.host}`;
+  });
 }
 
 /**
@@ -599,19 +848,40 @@ async function awaitBlockingFinal(
   mgr: JobManager,
   taskId: string,
   maxMs: number,
+  signal?: AbortSignal,
 ): Promise<Job> {
   const deadline = Date.now() + maxMs;
   for (;;) {
     const job = mgr.store.get(taskId);
     if (!job) throw notFound(`unknown task ${taskId}`);
     if (isFinalState(toTaskState(job.status))) return job;
+    // The caller is gone: hand back the current task and stop holding a
+    // request slot. The job continues in the background.
+    if (signal?.aborted) return job;
     if (Date.now() >= deadline) {
       // Cap reached: hand back the current (likely still working) task rather
       // than erroring, so the client can switch to polling / streaming.
       return job;
     }
-    await new Promise((r) => setTimeout(r, 300));
+    await sleepOrAbort(300, signal);
   }
+}
+
+/** setTimeout that resolves immediately when the signal aborts. */
+function sleepOrAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener('abort', finish, { once: true });
+  });
 }
 
 /* --------------------------------------------------------------- streaming */
@@ -661,7 +931,9 @@ async function handleStream(
   try {
     for await (const ev of subscribeTask(mgr, job.id, controller.signal, artifactBase(), a2aVersion)) {
       if (controller.signal.aborted) break;
-      writeEvent(res, ev);
+      writeEvent(res, ev, req.id ?? null);
+      // The generator now emits artifacts before the terminal status, so
+      // breaking here no longer truncates the deliverables.
       if (ev.kind === 'status-update' && ev.final) break;
     }
   } catch (err) {
@@ -671,8 +943,14 @@ async function handleStream(
   }
 }
 
-function writeEvent(res: http.ServerResponse, ev: TaskEvent): void {
-  res.write(`data: ${JSON.stringify(ev)}\n\n`);
+/**
+ * A2A streams SSE frames that are JSON-RPC *responses*, not bare events: the
+ * event travels in `result` and the response echoes the request id. Emitting
+ * the bare event meant a spec-compliant client saw `undefined.result` and
+ * silently dropped every update.
+ */
+function writeEvent(res: http.ServerResponse, ev: TaskEvent, id: string | number | null): void {
+  res.write(`data: ${JSON.stringify({ jsonrpc: JsonRpcVersion, id, result: ev })}\n\n`);
 }
 
 /** Serve a captured artifact (patch / report) file for a task. */
@@ -689,8 +967,18 @@ function serveArtifact(
     sendJson(res, 401, rpcError(A2A_ERROR.AUTH_REQUIRED, 'unauthorized: missing or invalid A2A token'));
     return;
   }
-  const taskId = decodeURIComponent(taskIdRaw);
-  const name = decodeURIComponent(nameRaw);
+  // Decode defensively: a malformed percent-escape (e.g. /a2a/artifacts/%zz/x)
+  // makes decodeURIComponent throw a URIError. Letting it escape would crash the
+  // listener; answer 400 instead.
+  let taskId: string;
+  let name: string;
+  try {
+    taskId = decodeURIComponent(taskIdRaw);
+    name = decodeURIComponent(nameRaw);
+  } catch {
+    sendJson(res, 400, { error: 'malformed artifact path' });
+    return;
+  }
   const job = mgr.store.get(taskId);
   if (!job) {
     sendJson(res, 404, { error: 'unknown task' });
@@ -708,22 +996,44 @@ function serveArtifact(
     filePath = job.reportFile;
     mime = 'text/markdown; charset=utf-8';
   }
-  if (!filePath || !fs.existsSync(filePath)) {
+  if (!filePath) {
     sendJson(res, 404, { error: 'artifact not found' });
     return;
   }
+  /**
+   * `existsSync` is not a type check: an artifact path can point at a directory
+   * (someone replaced the file, a partial extraction, a hostile symlink). A raw
+   * `createReadStream().pipe(res)` on a directory emits EISDIR asynchronously,
+   * which is an *uncaught* exception and takes the whole bridge down - a remote
+   * crash reachable from an unauthenticated GET in the default configuration.
+   * Stat first, refuse anything that is not a regular file, and route the stream
+   * through `pipeline` so every error lands on the response instead of the
+   * process.
+   */
+  let size: number;
   try {
-    const size = fs.statSync(filePath).size;
-    res.writeHead(200, {
-      'content-type': mime,
-      'content-length': size,
-      'cache-control': 'no-store',
-    });
-    fs.createReadStream(filePath).pipe(res);
-  } catch (err) {
-    log.warn('artifact serve failed', { taskId, name, err: String(err) });
-    if (!res.headersSent) sendJson(res, 500, { error: 'artifact serve failed' });
+    const st = fs.statSync(filePath);
+    if (!st.isFile()) {
+      sendJson(res, 404, { error: 'artifact not found' });
+      return;
+    }
+    size = st.size;
+  } catch {
+    sendJson(res, 404, { error: 'artifact not found' });
+    return;
   }
+  res.writeHead(200, {
+    'content-type': mime,
+    'content-length': size,
+    'cache-control': 'no-store',
+  });
+  pipeline(fs.createReadStream(filePath), res, (err) => {
+    if (!err) return;
+    log.warn('artifact stream failed', { taskId, name, err: String(err) });
+    // Headers are already out; the honest signal left is to break the response
+    // so the client sees a truncated body rather than a silently short file.
+    if (!res.writableEnded) res.destroy();
+  });
 }
 
 /**
@@ -731,7 +1041,7 @@ function serveArtifact(
  * bridge into a Server-Side Request Forgery: only public http(s) endpoints are
  * allowed, and private / loopback / link-local hosts are blocked.
  */
-function unsafePushUrl(url: string, allowlist?: string[]): string | null {
+export function unsafePushUrl(url: string, allowlist?: string[]): string | null {
   let u: URL;
   try {
     u = new URL(url);
@@ -741,26 +1051,28 @@ function unsafePushUrl(url: string, allowlist?: string[]): string | null {
   if (u.protocol !== 'http:' && u.protocol !== 'https:') {
     return `unsupported scheme "${u.protocol}" (only http/https allowed)`;
   }
-  const host = u.hostname;
-  if (allowlist && (allowlist.includes(host) || allowlist.includes(u.host))) {
+  // WHATWG URL keeps IPv6 literals bracketed in `hostname` ("[::1]"), so strip
+  // the brackets before classifying. Treat only genuine IP literals with the IP
+  // rules below; domain names must NOT be matched by IPv6 prefix heuristics (an
+  // earlier version rejected legitimate hosts like fc2.com / fdic.gov).
+  const rawHost = u.hostname;
+  const host = rawHost.startsWith('[') && rawHost.endsWith(']')
+    ? rawHost.slice(1, -1)
+    : rawHost;
+
+  if (allowlist && (allowlist.includes(rawHost) || allowlist.includes(host) || allowlist.includes(u.host) || allowlist.includes(`${u.protocol}//${u.host}`))) {
     return null; // explicitly trusted target
   }
-  if (host === 'localhost' || host.endsWith('.localhost') || host === '0.0.0.0') {
-    return 'localhost is not an allowed push target';
-  }
-  if (host === '::1' || host.startsWith('fc') || host.startsWith('fd') || /^fe[89ab]/i.test(host)) {
-    return 'IPv6 loopback / unique-local / link-local is not an allowed push target';
-  }
-  const octets = host.split('.');
-  if (octets.length === 4 && octets.every((o) => /^\d{1,3}$/.test(o))) {
-    const a = Number(octets[0]);
-    const b = Number(octets[1]);
-    if (a === 10) return 'RFC1918 private (10/8) is not an allowed push target';
-    if (a === 127) return 'loopback (127/8) is not an allowed push target';
-    if (a === 169 && b === 254) return 'link-local (169.254/16) is not an allowed push target';
-    if (a === 172 && b >= 16 && b <= 31) return 'RFC1918 private (172.16/12) is not an allowed push target';
-    if (a === 192 && b === 168) return 'RFC1918 private (192.168/16) is not an allowed push target';
-  }
+
+  // One shared classifier for literals, so `hostname` and DNS-resolved
+  // addresses can never drift apart in what they consider private.
+  const literalReason = privateAddressReason(host);
+  if (literalReason) return literalReason;
+  if (isIP(host) !== 0) return null; // a public IP literal; nothing else to check
+  // Remaining risk (documented, not silently ignored): a public hostname that
+  // resolves to a private IP via DNS rebinding still passes this string-level
+  // check. Closing that fully requires resolving DNS and re-checking the IP at
+  // connect time; operators who need it should set a2aPushUrlAllowlist.
   return null;
 }
 

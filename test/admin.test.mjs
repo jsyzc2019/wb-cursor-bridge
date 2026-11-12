@@ -13,6 +13,9 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
+import { fakeBin } from './fake-bin.mjs';
+import { rmrf } from './tmp.mjs';
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function httpGet(url) {
@@ -62,7 +65,7 @@ function startAdminBridge(envExtra = {}) {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,
-        CURSOR_BIN: path.join(ROOT, 'test', 'fake-agent.sh'),
+        CURSOR_BIN: fakeBin('cursor'),
         CURSOR_BRIDGE_WORKSPACE_ROOTS: repo,
         CURSOR_BRIDGE_STATE_DIR: stateDir,
         CURSOR_BRIDGE_LOG_LEVEL: 'info',
@@ -89,7 +92,29 @@ function waitForPort(proc, timeoutMs = 5000) {
   });
 }
 
-test('admin: /healthz and /stats are readable without token', async () => {
+/**
+ * Wait for the child to exit, but never forever.
+ *
+ * `await new Promise((r) => proc.on('close', r))` is a silent hang when the
+ * child does not exit (Windows shutdown paths differ): the whole suite stalls
+ * until the CI job timeout with no failing test to point at. A bounded wait
+ * turns "hung" into "failed with a reason".
+ */
+function waitClose(proc, timeoutMs = 15_000) {
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`bridge did not exit within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    proc.once('close', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+test('admin: /healthz and /stats are readable without token', { timeout: 30_000 }, async () => {
   const { proc, repo, stateDir } = startAdminBridge({ CURSOR_BRIDGE_ADMIN_PORT: '17901' });
   try {
     const port = await waitForPort(proc);
@@ -106,12 +131,15 @@ test('admin: /healthz and /stats are readable without token', async () => {
     assert.ok(Array.isArray(jobs.body));
   } finally {
     proc.kill();
-    rmSync(stateDir, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
+    // Wait for the process to actually go away before unlinking: on Windows a
+    // still-open handle makes rmdir EBUSY, and retries alone just spin.
+    await waitClose(proc, 5000).catch(() => {});
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
-test('admin: /admin/shutdown requires token when configured', async () => {
+test('admin: /admin/shutdown requires token when configured', { timeout: 30_000 }, async () => {
   const { proc, repo, stateDir } = startAdminBridge({
     CURSOR_BRIDGE_ADMIN_PORT: '17902',
     CURSOR_BRIDGE_ADMIN_SHUTDOWN_TOKEN: 'secret-xyz',
@@ -127,25 +155,45 @@ test('admin: /admin/shutdown requires token when configured', async () => {
     assert.equal(withHeader.status, 200);
     assert.equal(withHeader.body.ok, true);
 
-    // Wait for the bridge to actually exit.
-    await new Promise((resolve) => proc.on('close', resolve));
+    // Wait for the bridge to actually exit — bounded, so a stuck shutdown is a
+    // test failure rather than a 30-minute CI stall.
+    await waitClose(proc);
   } finally {
     proc.kill();
-    rmSync(stateDir, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
+    // Wait for the process to actually go away before unlinking: on Windows a
+    // still-open handle makes rmdir EBUSY, and retries alone just spin.
+    await waitClose(proc, 5000).catch(() => {});
+    rmrf(stateDir);
+    rmrf(repo);
   }
 });
 
-test('admin: /admin/shutdown works without token when not configured', async () => {
+test('admin: /admin/shutdown is refused when no token is configured (fail closed)', { timeout: 30_000 }, async () => {
   const { proc, repo, stateDir } = startAdminBridge({ CURSOR_BRIDGE_ADMIN_PORT: '17903' });
   try {
     const port = await waitForPort(proc);
     const res = await httpPost(`http://127.0.0.1:${port}/admin/shutdown`);
-    assert.equal(res.status, 200);
-    await new Promise((resolve) => proc.on('close', resolve));
+    // No token configured => the endpoint is disabled, not open. A control
+    // plane reachable by any local process is not a control plane.
+    assert.equal(res.status, 503);
+    assert.match(JSON.stringify(res.body), /set CURSOR_BRIDGE_ADMIN_SHUTDOWN_TOKEN/);
+    let exited = false;
+    proc.on('close', () => {
+      exited = true;
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(exited, false, 'the bridge must keep running');
   } finally {
     proc.kill();
-    rmSync(stateDir, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
+    // Wait for the child to stop writing before removing its state directory.
+    await new Promise((r) => {
+      const t = setTimeout(r, 1500);
+      proc.once('close', () => {
+        clearTimeout(t);
+        r();
+      });
+    });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    rmrf(repo);
   }
 });

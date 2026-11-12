@@ -40,6 +40,19 @@ export interface ExtraSkill {
   examples?: string[];
 }
 
+/**
+ * A display name that is safe to publish on the unauthenticated Agent Card.
+ *
+ * The card is world-readable (as A2A requires), so echoing the absolute root
+ * ("/home/alice/secret-project") disclosed the host user name, the directory
+ * layout and the project's location. The basename is enough for a client to
+ * choose a skill; the full path stays server-side and is only used for the
+ * whitelist decision.
+ */
+function publicName(root: string): string {
+  return path.basename(root.replace(/[\\/]+$/, '')) || 'workspace';
+}
+
 function slug(root: string): string {
   const trimmed = root.replace(/[\\/]+$/, '');
   const base = path.basename(trimmed) || 'workspace';
@@ -83,16 +96,16 @@ export function deriveSkills(
     }
     const card: AgentSkill = {
       id,
-      name: `Cursor coding agent · ${path.basename(root.replace(/[\\/]+$/, '')) || 'workspace'}`,
+      name: `Cursor coding agent · ${publicName(root)}`,
       description:
-        `Delegate coding tasks to the Cursor sub-agent inside ${root}. ` +
+        `Delegate coding tasks to the Cursor sub-agent inside ${publicName(root)}. ` +
         `Tiers: consult (read-only Q&A), plan (read-only planning), ` +
         `execute (writes inside an isolated git worktree).`,
       tags: ['coding', 'cursor', 'code-generation', 'refactor', 'review'],
       examples: [
-        `Implement a new feature in ${root}`,
-        `Review the pending changes under ${root}`,
-        `Write tests for an existing module in ${root}`,
+        `Implement a new feature in ${publicName(root)}`,
+        `Review the pending changes under ${publicName(root)}`,
+        `Write tests for an existing module in ${publicName(root)}`,
       ],
       inputModes: ['text/plain'],
       outputModes: ['text/plain', 'text/markdown', 'application/json'],
@@ -116,19 +129,19 @@ export function deriveSkills(
     }
     const card: AgentSkill = {
       id,
-      name: ex.name ?? `Cursor coding agent · ${path.basename(resolved.replace(/[\\/]+$/, '')) || 'workspace'}`,
+      name: ex.name ?? `Cursor coding agent · ${publicName(resolved)}`,
       description:
         ex.description ??
-        `Delegate coding tasks to the Cursor sub-agent inside ${resolved}. ` +
+        `Delegate coding tasks to the Cursor sub-agent inside ${publicName(resolved)}. ` +
           `Tiers: consult (read-only Q&A), plan (read-only planning), ` +
           `execute (writes inside an isolated git worktree).`,
       tags: ex.tags ?? ['coding', 'cursor', 'code-generation', 'refactor', 'review'],
       examples:
         ex.examples ??
         [
-          `Implement a new feature in ${resolved}`,
-          `Review the pending changes under ${resolved}`,
-          `Write tests for an existing module in ${resolved}`,
+          `Implement a new feature in ${publicName(resolved)}`,
+          `Review the pending changes under ${publicName(resolved)}`,
+          `Write tests for an existing module in ${publicName(resolved)}`,
         ],
       inputModes: ['text/plain'],
       outputModes: ['text/plain', 'text/markdown', 'application/json'],
