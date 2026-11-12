@@ -670,6 +670,27 @@ function leftoverWorktrees(stateDir) {
   return out;
 }
 
+/**
+ * Poll until every worktree is reaped.
+ *
+ * Removal runs *after* the terminal state is published, and on Windows the
+ * agent's cwd handle is released asynchronously — the reaper retries up to
+ * ~1.8s. A fixed 300ms "beat" is therefore a race on Windows and slack on
+ * POSIX. Poll with a deadline: a directory that never goes away is still a
+ * real leak, so this fails loudly instead of masking it.
+ */
+async function waitNoLeftovers(stateDir, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  for (let attempt = 0; ; attempt += 1) {
+    const left = leftoverWorktrees(stateDir);
+    if (left.length === 0) return;
+    if (Date.now() > deadline) {
+      throw new Error(`worktrees were never reaped: ${JSON.stringify(left)}`);
+    }
+    await new Promise((r) => setTimeout(r, pollDelay(attempt)));
+  }
+}
+
 test('a2a(P3#20): a crashed agent does not leak its git worktree', async () => {
   const repo = makeRepo();
   const stateDir = mkdtempSync(path.join(os.tmpdir(), 'wbstate-a2a-wt-'));
@@ -685,13 +706,7 @@ test('a2a(P3#20): a crashed agent does not leak its git worktree', async () => {
     const id = body.result.id;
     const done = await waitForTask(base, id, ['failed'], 8000);
     assert.equal(done.status.state, 'failed', 'crashed task is marked failed');
-    // Give the finally block a beat to remove the worktree.
-    await new Promise((r) => setTimeout(r, 300));
-    assert.deepEqual(
-      leftoverWorktrees(stateDir),
-      [],
-      'no worktree left behind after the agent crashed',
-    );
+    await waitNoLeftovers(stateDir);
   } finally {
     server.close();
     await rmSafe(stateDir);

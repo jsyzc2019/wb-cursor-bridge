@@ -13,12 +13,40 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdi
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createClient, waitFor } from './client.mjs';
+import { createClient, waitFor, pollDelay } from './client.mjs';
 import { fakeBin } from './fake-bin.mjs';
 import { rmrf } from './tmp.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FAKE = fakeBin('cursor');
+
+/**
+ * Wait for a job's worktree to be reaped.
+ *
+ * `finalise()` publishes the terminal state *before* `removeWorktree()` runs —
+ * deliberate, so cleanup can never delay the caller from seeing a result. On
+ * POSIX the directory is gone the same tick; on Windows the agent's cwd handle
+ * is released asynchronously, so removal retries for up to ~1.8s. Asserting at
+ * the instant of settlement therefore races the reaper.
+ *
+ * Polls instead, and still fails loudly if the directory never goes away (that
+ * would be a real leak, not a timing artefact).
+ */
+async function waitForWorktreesGone(instanceDir, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  let seen;
+  for (let attempt = 0; ; attempt += 1) {
+    seen = existsSync(instanceDir) ? readdirSync(instanceDir) : [];
+    const leftovers = seen.filter((name) => name !== 'owner.json');
+    if (leftovers.length === 0) return;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `worktree never reaped within ${timeoutMs}ms: ${JSON.stringify(leftovers)}`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, pollDelay(attempt)));
+  }
+}
 
 function makeRepo() {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'wbrepo-'));
@@ -133,16 +161,13 @@ test('e2e: execute job is isolated in a worktree and its patch is captured', asy
     assert.ok(diff.data.changedFiles.includes('changed-by-fake.txt'));
     assert.equal(typeof diff.data.patch, 'string');
 
-    // The worktree must be gone once the job settles. The per-instance
-    // container itself stays behind holding only its owner record, so that
-    // sibling instances can tell it apart from an abandoned directory.
+    // The worktree must be reaped once the job settles (see
+    // waitForWorktreesGone: removal is asynchronous by design). The
+    // per-instance container stays behind holding only its owner record, so
+    // that sibling instances can tell it apart from an abandoned directory.
     const containers = readdirSync(path.join(stateDir, 'worktrees'));
     assert.equal(containers.length, 1, `expected one instance container, got ${JSON.stringify(containers)}`);
-    assert.deepEqual(
-      readdirSync(path.join(stateDir, 'worktrees', containers[0])),
-      ['owner.json'],
-      'no worktree should remain after the job settles',
-    );
+    await waitForWorktreesGone(path.join(stateDir, 'worktrees', containers[0]));
   } finally {
     await client.close();
     rmrf(stateDir);
