@@ -93,6 +93,9 @@ jobs:
       # only reason a2a/stress/fault were skipped here. They now run as-is.
       - name: Main suite (unit + e2e + admin + a2a + hardening + audit)
         shell: pwsh
+        # A hung child used to stall this step until the 30-minute job cap, with
+        # no failing test named. 12 minutes is ~4x the observed worst case.
+        timeout-minutes: 12
         run: npm test
       - name: Stress and fault suites
         shell: pwsh

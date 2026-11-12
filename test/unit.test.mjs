@@ -78,10 +78,28 @@ test('assertWorkspaceAllowed: rejects NUL bytes and reserved device names', () =
   }
 });
 
-test('assertWorkspaceAllowed: rejects 8.3 short names', () => {
+test('assertWorkspaceAllowed: a "~1"-shaped directory name is allowed, not treated as a short-name alias', () => {
+  // Regression: rejecting every component matching /~[0-9]+$/ failed *every*
+  // Windows CI e2e case, because GitHub runners expose
+  // %TEMP% = C:\Users\RUNNER~1\AppData\Local\Temp. A short name always aliases
+  // an entry in the same parent, so it grants no traversal power; the realpath
+  // gate below is what enforces containment.
   const root = mkdtempSync(path.join(os.tmpdir(), 'wbroot-'));
+  const dir = path.join(root, 'data~1');
   try {
-    assert.throws(() => assertWorkspaceAllowed(`${root}/REPO~1`, [root]), /short name/);
+    try {
+      mkdirSync(dir);
+    } catch {
+      return; // NTFS refused to create the literal name; nothing to assert here
+    }
+    assert.equal(assertWorkspaceAllowed(dir, [root]), canonical(fs.realpathSync.native(dir)));
+    // Still contained-or-nothing: the sibling outside the root stays refused.
+    const outside = mkdtempSync(path.join(os.tmpdir(), 'wboutside-'));
+    try {
+      assert.throws(() => assertWorkspaceAllowed(outside, [root]), /outside every configured root/);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -91,7 +91,29 @@ function waitForPort(proc, timeoutMs = 5000) {
   });
 }
 
-test('admin: /healthz and /stats are readable without token', async () => {
+/**
+ * Wait for the child to exit, but never forever.
+ *
+ * `await new Promise((r) => proc.on('close', r))` is a silent hang when the
+ * child does not exit (Windows shutdown paths differ): the whole suite stalls
+ * until the CI job timeout with no failing test to point at. A bounded wait
+ * turns "hung" into "failed with a reason".
+ */
+function waitClose(proc, timeoutMs = 15_000) {
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`bridge did not exit within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    proc.once('close', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+test('admin: /healthz and /stats are readable without token', { timeout: 30_000 }, async () => {
   const { proc, repo, stateDir } = startAdminBridge({ CURSOR_BRIDGE_ADMIN_PORT: '17901' });
   try {
     const port = await waitForPort(proc);
@@ -113,7 +135,7 @@ test('admin: /healthz and /stats are readable without token', async () => {
   }
 });
 
-test('admin: /admin/shutdown requires token when configured', async () => {
+test('admin: /admin/shutdown requires token when configured', { timeout: 30_000 }, async () => {
   const { proc, repo, stateDir } = startAdminBridge({
     CURSOR_BRIDGE_ADMIN_PORT: '17902',
     CURSOR_BRIDGE_ADMIN_SHUTDOWN_TOKEN: 'secret-xyz',
@@ -129,8 +151,9 @@ test('admin: /admin/shutdown requires token when configured', async () => {
     assert.equal(withHeader.status, 200);
     assert.equal(withHeader.body.ok, true);
 
-    // Wait for the bridge to actually exit.
-    await new Promise((resolve) => proc.on('close', resolve));
+    // Wait for the bridge to actually exit — bounded, so a stuck shutdown is a
+    // test failure rather than a 30-minute CI stall.
+    await waitClose(proc);
   } finally {
     proc.kill();
     rmSync(stateDir, { recursive: true, force: true });
@@ -138,7 +161,7 @@ test('admin: /admin/shutdown requires token when configured', async () => {
   }
 });
 
-test('admin: /admin/shutdown is refused when no token is configured (fail closed)', async () => {
+test('admin: /admin/shutdown is refused when no token is configured (fail closed)', { timeout: 30_000 }, async () => {
   const { proc, repo, stateDir } = startAdminBridge({ CURSOR_BRIDGE_ADMIN_PORT: '17903' });
   try {
     const port = await waitForPort(proc);
