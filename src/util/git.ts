@@ -167,7 +167,15 @@ export async function changedFiles(worktreePath: string, baseCommit = 'HEAD'): P
 /**
  * Remove a worktree, pruning metadata and tolerating a dirty tree.
  * Never throws: cleanup must not mask a job result.
+ *
+ * Windows specific: `git worktree remove` can fail while any handle is still
+ * open inside the tree (an agent that just exited still holds its cwd for a
+ * few hundred ms), and a single `rmSync` then fails with EBUSY/EPERM. A short
+ * bounded retry is what makes "the worktree is gone when the job settles"
+ * true on Windows instead of merely true on POSIX.
  */
+const WINDOWS_LOCK_CODES = new Set(['EBUSY', 'EPERM', 'ENOTEMPTY', 'EACCES']);
+
 export async function removeWorktree(wt: Worktree): Promise<void> {
   try {
     await git(wt.repo, ['worktree', 'remove', '--force', wt.path], 30_000);
@@ -178,10 +186,22 @@ export async function removeWorktree(wt: Worktree): Promise<void> {
       /* give up quietly */
     }
   }
-  try {
-    fs.rmSync(wt.path, { recursive: true, force: true });
-  } catch {
-    /* ignore */
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    try {
+      fs.rmSync(wt.path, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
+      return;
+    } catch (err) {
+      const code: unknown = (err as { code?: unknown }).code;
+      // A real error (ENOTDIR, ENOENT on a parent…) means there is nothing to
+      // reclaim; only lock contention is worth waiting out.
+      if (typeof code !== 'string' || !WINDOWS_LOCK_CODES.has(code)) return;
+      await new Promise((r) => setTimeout(r, 150));
+    }
   }
 }
 
