@@ -23,7 +23,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -34,6 +34,7 @@ import { buildArgs } from '../dist/cursor/cli.js';
 import { VERSION } from '../dist/version.js';
 import { fakeBin } from './fake-bin.mjs';
 import { rmrf } from './tmp.mjs';
+import { pollDelay } from './client.mjs';
 
 const FAKE = fakeBin('cursor');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -110,11 +111,11 @@ function post(port, body, headers = {}) {
 
 async function waitStatus(mgr, id, wanted, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
+  for (let attempt = 0; ; attempt += 1) {
     const job = mgr.store.get(id);
     if (job && wanted.includes(job.status)) return job;
     if (Date.now() > deadline) throw new Error(`job ${id} stuck in ${job && job.status}`);
-    await sleep(80);
+    await sleep(pollDelay(attempt));
   }
 }
 
@@ -264,7 +265,12 @@ test('ENG-21: a grandchild holding stdout cannot strand the concurrency slot', a
   process.env.WB_HOLD_PIDFILE = pidFile;
   try {
     const job = mgr.start({ prompt: 'hold the pipe', workspace: repo, tier: 'consult', timeoutSec: 20 });
-    await sleep(600);
+    // Wait for the grandchild to announce itself instead of sleeping a fixed
+    // 600ms: the fixture writes the pidfile ~200ms in, and the rest was slack.
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (existsSync(pidFile)) break;
+      await sleep(pollDelay(attempt));
+    }
     const started = Date.now();
     mgr.cancel(job.id);
     // abortRun waits 2s for the tail, then settles regardless of `close`.
@@ -347,7 +353,12 @@ test('B0-7: resuming an input-required task respects maxConcurrency', async () =
 
     process.env.WB_FAKE_MODE = 'hang';
     const b = mgr.start({ prompt: 'occupy the only slot', workspace: repo, tier: 'consult', timeoutSec: 20 });
-    await sleep(300);
+    // `start()` claims the slot synchronously (inflight.set before spawn), so
+    // wait on the slot itself rather than sleeping 300ms to hope it happened.
+    for (let attempt = 0; mgr.inflight.size < 1 && attempt < 100; attempt += 1) {
+      await sleep(pollDelay(attempt));
+    }
+    assert.equal(mgr.inflight.size, 1, 'the hanging job should hold the only slot');
     assert.equal(mgr.inflight.size, 1);
 
     assert.throws(() => mgr.reply(a.id, 'yes continue'), /concurrency limit/);

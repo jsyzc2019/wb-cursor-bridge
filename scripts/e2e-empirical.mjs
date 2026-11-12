@@ -78,14 +78,17 @@ function userMessage(text, metadata) {
   return { role: 'user', parts: [{ kind: 'text', text }], ...(metadata ? { metadata } : {}) };
 }
 
+/** 轮询退避：短任务秒命中，长任务退化到 200ms，避免固定间隔的呆等。 */
+const pollDelay = (attempt) => Math.min(20 * 1.6 ** attempt, 200);
+
 async function waitFinal(base, id, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
+  for (let attempt = 0; ; attempt += 1) {
     const { body } = await rpc(base, 'tasks/get', { id, historyLength: 20 });
     const state = body?.result?.status?.state;
     if (state === 'completed' || state === 'failed' || state === 'canceled') return body.result;
     if (Date.now() > deadline) throw new Error(`task ${id} 未在 ${timeoutMs}ms 内终态（卡在 ${state}）`);
-    await new Promise((r) => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, pollDelay(attempt)));
   }
 }
 
@@ -482,13 +485,13 @@ async function scenarioInputRequired() {
 
 async function waitFinalOrState(base, id, target, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
+  for (let attempt = 0; ; attempt += 1) {
     const { body } = await rpc(base, 'tasks/get', { id, historyLength: 20 });
     const state = body?.result?.status?.state;
     if (state === target) return body.result;
     if (['completed', 'failed', 'canceled'].includes(state)) return body.result;
     if (Date.now() > deadline) throw new Error(`task ${id} 未到 ${target}（卡在 ${state}）`);
-    await new Promise((r) => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, pollDelay(attempt)));
   }
 }
 
@@ -607,8 +610,9 @@ async function scenarioPushSsrf() {
     }, 'topsecret');
     check(scenario, '任务仍创建（webhook 仅被忽略）', !!sent.body?.result?.id, `id=${sent.body?.result?.id}`);
 
-    // 等待后确认无任何投递
-    await new Promise((r) => setTimeout(r, 4000));
+    // 等待后确认无任何投递：若守卫缺失，推送会在任务开始 ~200ms 内同步发出，
+    // 1.5s 已是 7 倍余量（原先盲等 4s）。
+    await new Promise((r) => setTimeout(r, 1500));
     check(scenario, '无 allowlist → 不向 loopback 投递', hook.received.length === 0, `received=${hook.received.length}`);
   } finally {
     bridge?.stop();

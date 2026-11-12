@@ -1,6 +1,6 @@
 {
   "name": "wb-cursor-bridge",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "MCP bridge that exposes the Cursor CLI as a governed sub-agent to WorkBuddy.",
   "type": "module",
   "license": "MIT",
@@ -36,7 +36,8 @@
     "build:release": "npm run build && node scripts/build-release.mjs",
     "start": "node dist/index.js",
     "prepublishOnly": "npm run lint && npm run typecheck && npm test",
-    "verify": "npm run lint && npm run typecheck && npm test && npm run test:stress && npm run test:fault && npm run build:release",
+    "verify": "node scripts/verify.mjs",
+    "verify:serial": "npm run lint && npm run typecheck && npm test && npm run test:stress && npm run test:fault && npm run build:release",
     "test:audit": "node --test test/audit-*.test.mjs"
   },
   "keywords": [

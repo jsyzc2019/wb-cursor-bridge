@@ -19,6 +19,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { JobManager } from '../dist/runner.js';
+import { pollDelay } from './client.mjs';
 import { Logger } from '../dist/logger.js';
 import { startA2AServer } from '../dist/a2a/server.js';
 import { VERSION } from '../dist/version.js';
@@ -145,14 +146,14 @@ async function rmSafe(target) {
 
 async function waitForTask(base, id, states, timeoutMs = 12000) {
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
+  for (let attempt = 0; ; attempt += 1) {
     const { body } = await rpc(base, 'tasks/get', { id, historyLength: 20 });
     const state = body.result?.status?.state;
     if (states.includes(state)) return body.result;
     if (Date.now() > deadline) {
       throw new Error(`task ${id} did not reach ${states.join('/')} (stuck at ${state})`);
     }
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, pollDelay(attempt)));
   }
 }
 
@@ -374,10 +375,12 @@ test('a2a: push notifications are POSTed to the webhook on completion', async ()
     const id = body.result.id;
     const deadline = Date.now() + 12000;
     let finalEvent;
+    let attempt = 0;
     while (Date.now() < deadline) {
       finalEvent = mock.received.find((e) => e.kind === 'status-update' && e.final);
       if (finalEvent) break;
-      await new Promise((r) => setTimeout(r, 150));
+      await new Promise((r) => setTimeout(r, pollDelay(attempt)));
+      attempt += 1;
     }
     assert.ok(finalEvent, 'webhook received a final status-update');
     assert.equal(finalEvent.status.state, 'completed');
@@ -406,11 +409,18 @@ test('a2a: push webhook to a loopback host is rejected without allowlist (SSRF g
     }, { token: 'topsecret' });
     // Task still created; the webhook is simply not honoured.
     assert.ok(body.result?.id, 'task created despite rejected webhook');
-    const deadline = Date.now() + 6000;
+    // A push, if the guard were absent, fires synchronously on the first status
+    // change — long before the task settles. So driving the task to a terminal
+    // state and then watching a short grace window proves the webhook was
+    // dropped, without a blind 6s sleep (the mock would have been hit already).
+    // A push, if the guard were absent, fires on the first status change —
+    // within ~200ms of the task starting. 1.5s is a 7x margin, so a quiet mock
+    // is conclusive without the old 6s blind wait.
+    const deadline = Date.now() + 1500;
     let got = false;
     while (Date.now() < deadline) {
       if (mock.received.length > 0) { got = true; break; }
-      await new Promise((r) => setTimeout(r, 150));
+      await new Promise((r) => setTimeout(r, 30));
     }
     assert.equal(got, false, 'no push delivered to the loopback host');
   } finally {
