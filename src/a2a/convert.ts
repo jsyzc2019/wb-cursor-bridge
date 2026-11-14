@@ -9,7 +9,7 @@
  * so the conversion rules live in exactly one file.
  */
 import { randomUUID } from 'node:crypto';
-import { buildArtifacts } from '../artifacts.js';
+import { buildArtifacts, buildStructuredArtifacts, classifyTranscript, structuredCost } from '../artifacts.js';
 import type { ArtifactPart, Job, Tier } from '../types.js';
 import { toV1Task, type A2AVersion } from './compat.js';
 import type {
@@ -174,6 +174,30 @@ export function toTask(job: Job, opts: ToTaskOptions = {}): Task {
     parts: a.parts.map((p) => rewriteFileUri(p, job.id, a.name, opts.artifactBase)) as Part[],
   }));
 
+  // P2: semantic artifacts (transcript / toolCalls / cost / permissionRequest)
+  // are derived from the event stream. The legacy *static* `a2aProtocolVersion:
+  // '1.0'` switch uses compat.ts's shallow mapper, which would leak the v0.3
+  // `kind` field into data parts; that historical path is left untouched. The
+  // real v1.0 runtime path emits the internal 0.3 model here and is translated
+  // by v1.ts:wrapV1Result(), which handles data parts correctly.
+  const structured = opts.a2aVersion === '1.0' ? [] : buildStructuredArtifacts(job);
+  for (const a of structured) {
+    artifacts.push({
+      artifactId: a.artifactId,
+      name: a.name,
+      // Same boundary cast as buildArtifacts() above: the internal
+      // ArtifactPart shape is structurally what the A2A Part union accepts.
+      parts: a.parts as unknown as Part[],
+    });
+  }
+  const cost = structured.length > 0
+    ? structuredCost(
+        job,
+        classifyTranscript(job).length,
+        (job.events ?? []).filter((e) => e.type === 'tool').length,
+      )
+    : undefined;
+
   const task: Task = {
     id: job.id,
     contextId,
@@ -187,6 +211,7 @@ export function toTask(job: Job, opts: ToTaskOptions = {}): Task {
       isolation: job.isolation,
       workspace: job.workspace,
       skillId: job.metadata?.skillId,
+      ...(cost ? { cost } : {}),
     },
   };
   if (artifacts.length > 0) task.artifacts = artifacts;

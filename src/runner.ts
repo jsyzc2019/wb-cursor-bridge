@@ -200,6 +200,23 @@ export class JobManager {
 
   start(opts: StartJobOptions): Job {
     /**
+     * P3: idempotent submission. A repeat with the same requestKey resolves to
+     * the SAME job and never spawns a second run. This runs BEFORE the
+     * concurrency checks on purpose: a network retry arriving while the bridge
+     * is saturated must still return the original job, not E_CONCURRENCY.
+     */
+    if (opts.requestKey) {
+      const existing = this.store.findByRequestKey(opts.requestKey);
+      if (existing) {
+        this.log.info('job deduplicated by requestKey', {
+          jobId: existing.id,
+          requestKey: opts.requestKey,
+        });
+        return existing;
+      }
+    }
+
+    /**
      * Two different ceilings. `maxConcurrency` bounds work happening *now*;
      * `maxLiveJobs` bounds tasks that still hold state (running + paused). The
      * latter used to be unbounded: eight paused tasks with `maxJobs = 5` stayed
@@ -252,6 +269,9 @@ export class JobManager {
         this.cfg.forceWorktree || opts.tier === 'execute'
           ? 'bridge-worktree'
           : 'none',
+      // P3: identity + first checkpoint travel in the same atomic create().
+      requestKey: opts.requestKey,
+      checkpoint: 'accepted',
     };
 
     this.store.create(job);
@@ -441,10 +461,10 @@ export class JobManager {
             this.store.touch();
           },
           onSpawn: (childPid) => {
-            job.pid = childPid;
-            // Persist immediately: the window we care about is a crash in the
-            // next few seconds, before any timer would fire.
-            this.store.persist();
+            // P3: commit the spawn checkpoint atomically with the pid. A crash
+            // in the next few seconds now leaves a recoverable "spawned" phase,
+            // not a checkpoint-less running job.
+            this.store.checkpoint(job, 'spawned', { pid: childPid });
           },
         },
         controller.signal,
@@ -557,7 +577,9 @@ export class JobManager {
       text: `input-required: ${outcome.needInput}`,
     });
     this.store.evictNow();
-    this.store.touch();
+    // P3: the pause phase is committed atomically with the state, so a restart
+    // preserves both the question and the fact that we are waiting on it.
+    this.store.checkpoint(job, 'input-required');
     void this.store.flushNow();
     this.log.info('job paused for input', { jobId: job.id, pendingInput: outcome.needInput });
   }
@@ -669,7 +691,8 @@ export class JobManager {
       type: 'end',
       text: `status=${status} exit=${outcome.exitCode} durationMs=${outcome.durationMs}`,
     });
-    this.store.touch();
+    // P3: final state + settled checkpoint + released lease in one atomic write.
+    this.store.checkpoint(job, 'settled');
     void this.store.flushNow();
 
     this.log.info('job finished', {

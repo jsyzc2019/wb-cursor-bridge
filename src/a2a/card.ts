@@ -99,13 +99,14 @@ export function buildV1AgentCard(opts: AgentCardOptions): Record<string, unknown
    * protocolVersion, tenant, url } — so the first (and preferred) interface
    * carries only those keys.
    *
-   * `pushNotifications` is deliberately false on the v1.0 wire: the bridge's
-   * webhook delivery still speaks the v0.3.0 event shape and requires an auth
-   * token + SSRF-safe public target, so it is NOT a conformant v1.0 push
-   * implementation. Declaring false is honest: a v1.0 client skips those
-   * operations instead of watching them fail, and the TCK's capability-gated
-   * MUST cases (CORE-CAP-001 / CARD-EXT-*) take their documented skip/error
-   * paths. Implementing the v1.0 push contract is tracked as follow-up work.
+   * `pushNotifications` is true on the v1.0 wire: src/a2a/push.ts implements
+   * the full contract (Create/Get/List/DeleteTaskPushNotificationConfig, a
+   * StreamResponse webhook body, the authentication.scheme/credentials pair,
+   * the same SSRF gate as the legacy path). It was false during P0 because the
+   * legacy webhook emits a bare v0.3 TaskEvent; a separate v1.0 watcher now
+   * wraps every event with toV1StreamResponse(). Declaring true only after the
+   * implementation exists keeps capability claims honest — see the P4 card
+   * scanner, which fails the build on an unbacked pushNotifications claim.
    *
    * `extendedAgentCard` is likewise omitted (not supported), which makes
    * GetExtendedAgentCard correctly answer UnsupportedOperationError (-32004).
@@ -118,7 +119,7 @@ export function buildV1AgentCard(opts: AgentCardOptions): Record<string, unknown
     version: base.version,
     capabilities: {
       streaming: base.capabilities.streaming ?? false,
-      pushNotifications: false,
+      pushNotifications: base.capabilities.pushNotifications ?? false,
     },
     defaultInputModes: base.defaultInputModes,
     defaultOutputModes: base.defaultOutputModes,
@@ -127,6 +128,18 @@ export function buildV1AgentCard(opts: AgentCardOptions): Record<string, unknown
       {
         url: opts.endpointUrl,
         protocolBinding: 'JSONRPC',
+        protocolVersion: '1.0',
+      },
+      /**
+       * HTTP+JSON (REST) binding. The same endpoint path is the REST base:
+       * the official TCK joins `base_url` with "/message:send", "/tasks/...",
+       * so `http://host/a2a` resolves to `/a2a/message:send` etc. JSONRPC
+       * stays first because the spec treats the first interface as preferred
+       * and the TCK's jsonrpc gate reads supportedInterfaces[0].
+       */
+      {
+        url: opts.endpointUrl,
+        protocolBinding: 'HTTP+JSON',
         protocolVersion: '1.0',
       },
     ],

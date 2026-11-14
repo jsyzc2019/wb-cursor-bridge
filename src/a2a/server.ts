@@ -47,6 +47,9 @@ import {
   toTaskState,
 } from './convert.js';
 import { subscribeTask, watchAndPush, isFinalState } from './watch.js';
+import { PushRegistry, attachPushRegistry, pushRegistryFor } from './push.js';
+import { handleRest, type RestDeps } from './rest.js';
+import { getAction } from '../actions/index.js';
 import {
   A2A_ERROR,
   JsonRpcVersion,
@@ -175,6 +178,21 @@ export function startA2AServer(
   let v1Card: Record<string, unknown> | null = null;
   const a2aVersion: A2AVersion = config.a2aProtocolVersion ?? '0.3.0';
 
+  /**
+   * v1.0 push notification registry, scoped to this server's JobManager.
+   * The SSRF gates are injected from this module (which owns them) so push.ts
+   * stays free of a circular import; the allowlist is the operator's explicit
+   * trust decision and is also what lets the official TCK target its loopback
+   * webhook receiver without weakening the production default.
+   */
+  attachPushRegistry(mgr, new PushRegistry({
+    log: log.child('push'),
+    allowlist: config.a2aPushUrlAllowlist,
+    isSafeLiteral: unsafePushUrl,
+    verifyTarget: verifyPushTarget,
+    deliveryEnabled: () => Boolean(config.a2aAuthToken),
+  }));
+
   const cardUrl = (): string => {
     const host =
       config.a2aPublicUrl ??
@@ -205,6 +223,25 @@ export function startA2AServer(
   let actualPort = config.a2aPort;
   const ratePerSec = config.a2aRateLimitPerSec ?? A2A_RATE_LIMIT_REFILL;
   const rateLimit = new PerClientRateLimiter(ratePerSec);
+
+  /** Callbacks that let the REST binding reuse the exact v1.0 dispatch path. */
+  const restDeps: RestDeps = {
+    dispatch: (innerReq) =>
+      dispatchRequest(mgr, skills, config, log, innerReq, artifactBaseUrl, '1.0'),
+    subscribe: (taskId, signal) =>
+      subscribeTask(mgr, taskId, signal, artifactBaseUrl(), '0.3.0'),
+    getJob: (taskId) => mgr.store.get(taskId),
+    toTask: (job) => toTask(job, {
+      withHistory: false, artifactBase: artifactBaseUrl(), a2aVersion: '0.3.0',
+    }),
+    authOk: (r) => authOk(r, config.a2aAuthToken),
+    // REST uses application/a2a+json, which the JSON-RPC content-type probe
+    // would reject; pass the accepted literal so only the message-part and
+    // context checks from the shared validator are applied.
+    assertWireInput: (p) => assertV1WireInput(p, mgr, 'application/json'),
+    isTerminal: (job) => isFinalState(toTaskState(job.status)),
+    log: log.child('rest'),
+  };
 
   const server = http.createServer((req, res) => {
     // Defence in depth: a synchronous throw anywhere below (e.g. a malformed
@@ -294,6 +331,24 @@ export function startA2AServer(
     const artMatch = url.match(/^\/a2a\/artifacts\/([^/]+)\/([^/]+)$/);
     if (artMatch && req.method === 'GET') {
       return serveArtifact(mgr, config, log, req, res, artMatch[1], artMatch[2]);
+    }
+
+    // HTTP+JSON (REST) binding. Same dispatch pipeline, bare ProtoJSON bodies
+    // and AIP-193 errors. The card advertises it as a second interface so the
+    // official TCK can build an http_json client and exercise it.
+    if (url.startsWith('/a2a/')) {
+      void handleRest(req, res, req.url ?? url, restDeps).then((handled) => {
+        if (!handled && !res.headersSent) {
+          sendJson(res, 404, {
+            error: { code: 404, status: 'NOT_FOUND', message: 'unknown REST operation', details: [] },
+          });
+        }
+      }).catch((err) => {
+        log.error('a2a rest request failed', { err: err instanceof Error ? err.stack : String(err) });
+        if (!res.headersSent) sendJson(res, 500, rpcError(A2A_ERROR.INTERNAL_ERROR, 'internal error'));
+        else if (!res.writableEnded) res.destroy();
+      });
+      return;
     }
 
     if (url === '/a2a' && req.method === 'GET') {
@@ -758,13 +813,22 @@ async function dispatchRequest(
     switch (req.method) {
       case 'tasks/list':
         return listTasksV1(mgr, params, artifactBase);
-      case 'tasks/pushConfig/create':
+      case 'tasks/pushConfig/create': {
+        const reg = pushRegistryFor(mgr);
+        const cfg = (params.config ?? {}) as Record<string, unknown>;
+        return reg.create(String(params.taskId ?? ''), cfg);
+      }
       case 'tasks/pushConfig/get':
+        return pushRegistryFor(mgr).get(String(params.taskId ?? ''), String(params.configId ?? ''));
       case 'tasks/pushConfig/list':
+        return pushRegistryFor(mgr).list(
+          String(params.taskId ?? ''),
+          typeof params.pageSize === 'number' ? params.pageSize : undefined,
+          typeof params.pageToken === 'string' ? params.pageToken : undefined,
+        );
       case 'tasks/pushConfig/delete':
-        // CORE-CAP-001: the v1.0 card declares pushNotifications:false, so
-        // every push-config operation MUST answer -32003.
-        throw new BridgePushNotSupported();
+        // PUSH-DEL-002: idempotent — a second delete must not error.
+        return pushRegistryFor(mgr).delete(String(params.taskId ?? ''), String(params.configId ?? ''));
       case 'agent/extendedCard':
         // CORE-CAP-003: no extendedAgentCard capability is declared.
         throw new BridgeUnsupported('GetExtendedAgentCard is not supported by this agent');
@@ -847,7 +911,7 @@ async function dispatch(
       assertOutputModesAccepted(configuration);
 
       const job = await createOrResume(mgr, skills, message);
-      maybePush(mgr, job, params, config, log);
+      maybePush(mgr, job, params, config, log, wireVersion);
 
       const historyLength = configuration?.historyLength;
       const withHistory = historyLength !== undefined;
@@ -895,7 +959,10 @@ async function dispatch(
       if (job.status !== 'running' && job.status !== 'input-required') {
         throw new BridgeCancelError();
       }
-      const cancelled = mgr.cancel(id);
+      // P1: same cancel Action as MCP cursor_cancel (A2A keeps its extra
+      // cancelability gate above, which is a protocol-level rule).
+      const cancel = getAction('cursor_cancel')!;
+      const cancelled = await cancel.invoke({ mgr }, cancel.parse({ jobId: id })) as Job;
       return toTask(cancelled, { withHistory: false, a2aVersion });
     }
 
@@ -926,13 +993,28 @@ async function createOrResume(
   if (message.taskId) {
     const existing = mgr.store.get(message.taskId);
     if (!existing) throw notFound(`unknown task ${message.taskId}`);
+    // P2: contextId continuation is explicit on BOTH wires. A caller naming a
+    // task and a context must name the context that task actually belongs to,
+    // otherwise a retry could silently attach a turn to the wrong conversation.
+    if (message.contextId && existing.contextId && existing.contextId !== message.contextId) {
+      throw badArgument(
+        `contextId "${message.contextId}" does not match task ${existing.id} ` +
+          `(context "${existing.contextId}")`,
+      );
+    }
     if (existing.status === 'running') {
       throw badArgument(`task ${message.taskId} is still running; cannot send input yet`);
     }
     if (existing.status === 'input-required') {
       // Resume the SAME task (input-required -> working -> completed on one id).
-      const resumed = mgr.reply(message.taskId, prompt, tier);
-      resumed.contextId = existing.contextId ?? resumed.contextId ?? randomUUID();
+      // P1: go through the shared reply Action so MCP and A2A cannot diverge.
+      const reply = getAction('cursor_reply')!;
+      const resumed = await reply.invoke(
+        { mgr }, reply.parse({ jobId: message.taskId, prompt, tier }),
+      ) as Job;
+      // P2: keep the explicit context across the resume; a caller-supplied
+      // contextId was validated against `existing` above.
+      resumed.contextId = message.contextId ?? existing.contextId ?? resumed.contextId ?? randomUUID();
       mgr.store.touch();
       return resumed;
     }
@@ -962,7 +1044,15 @@ async function createOrResume(
   }
 
   const contextId = message.contextId ?? randomUUID();
-  const job = mgr.start({ prompt, workspace: root, tier });
+  // P1: the single implementation of "start a job", shared with MCP cursor_run.
+  // Adding a run parameter (e.g. a request key) now becomes a one-place change.
+  const run = getAction('cursor_run')!;
+  // P3: the A2A messageId IS the natural idempotency key. A network retry of a
+  // fresh send (no taskId) now resolves to the same job instead of spawning a
+  // duplicate run. Continuations carry a taskId and take the resume path above.
+  const job = await run.invoke(
+    { mgr }, run.parse({ prompt, workspace: root, tier, requestKey: message.messageId }),
+  ) as Job;
   job.contextId = contextId;
   const skill = skills.find((s) => s.root === root);
   (job.metadata ??= {}).skillId = skill?.id;
@@ -984,10 +1074,26 @@ function maybePush(
   params: Record<string, unknown>,
   config: Config,
   log: Logger,
+  wireVersion: WireVersion = '0.3.0',
   signal?: AbortSignal,
 ): void {
   const push = pushConfigOf(params);
   if (!push) return;
+
+  if (wireVersion === '1.0') {
+    // v1.0: register the inline TaskPushNotificationConfig with the CRUD
+    // registry and drive delivery with StreamResponse payloads. The same
+    // auth guard as the legacy path applies (deliveryEnabled()).
+    try {
+      const reg = pushRegistryFor(mgr);
+      reg.registerInline(job.id, push as unknown as Record<string, unknown>);
+      if (config.a2aAuthToken) reg.watch(mgr, job.id, signal);
+    } catch (err) {
+      log.warn('v1 push config rejected', { taskId: job.id, err: String(err) });
+    }
+    return;
+  }
+
   if (!config.a2aAuthToken) {
     log.warn('push notifications ignored: A2A auth token is required to enable webhooks', {
       taskId: job.id,
@@ -1137,7 +1243,7 @@ async function handleStream(
       const message = requireMessage(params);
       assertOutputModesAccepted(configOf(params));
       job = await createOrResume(mgr, skills, message);
-      maybePush(mgr, job, params, config, log, controller.signal);
+      maybePush(mgr, job, params, config, log, wireVersion, controller.signal);
     } else {
       // tasks/resubscribe (v1.0 SubscribeToTask)
       const id = strParam(params, 'id', 'tasks/resubscribe.id');
@@ -1400,12 +1506,5 @@ class BridgeIncompatible extends Error {
   code = 'E_INCOMPATIBLE' as const;
 }
 
-/** CORE-CAP-001: the v1.0 card declares pushNotifications:false, so push-config
- * operations MUST answer -32003 rather than pretending to store a webhook. */
-class BridgePushNotSupported extends Error {
-  constructor() {
-    super('push notifications are not supported by this agent');
-    this.name = 'BridgePushNotSupported';
-  }
-  code = 'E_PUSH_NOT_SUPPORTED' as const;
-}
+/* v1.0 push config CRUD is implemented by src/a2a/push.ts. -32003 remains in
+ * A2A_ERROR for a future deployment that explicitly disables push again. */

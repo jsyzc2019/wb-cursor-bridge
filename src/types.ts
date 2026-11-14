@@ -103,7 +103,33 @@ export interface Job {
   pendingInput?: string;
   /** ISO-8601 timestamp of when the task entered `input-required`. */
   inputRequiredAt?: string;
+
+  /* ------------------------------------------------------------- P3: idempotency */
+
+  /** Client idempotency key: a repeat submission resolves to the SAME job. */
+  requestKey?: string;
+  /** Last atomically-committed business phase, for crash recovery. */
+  checkpoint?: JobCheckpoint;
+  /** Instance owning the current lease (only meaningful while running). */
+  leaseOwner?: string;
+  /** ISO-8601 lease expiry; a live lease must not be reclaimed or re-run. */
+  leaseExpiresAt?: string;
+  /** Completed side effects keyed by phase; recovery never replays these. */
+  sideEffects?: Record<string, string>;
 }
+
+/**
+ * P3 checkpoint boundaries. Each transition is committed atomically with the
+ * state change in `index.json`, so recovery can tell a phase that may have
+ * already performed an external side effect from one that has not started.
+ */
+export type JobCheckpoint =
+  | 'accepted'
+  | 'spawned'
+  | 'input-required'
+  | 'patch-exporting'
+  | 'push-sending'
+  | 'settled';
 
 /**
  * A2A-aligned deliverable. Mirrors A2A v1.0 `Artifact`: a named, addressable
@@ -140,6 +166,8 @@ export interface StartJobOptions {
   /** Resume an existing Cursor thread id. */
   resumeThreadId?: string;
   parentJobId?: string;
+  /** P3: idempotency key; a repeat start with the same key returns the same job. */
+  requestKey?: string;
 }
 
 /** Result payload handed back to the MCP caller. */
