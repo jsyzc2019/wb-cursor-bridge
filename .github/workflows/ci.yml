@@ -44,6 +44,36 @@ jobs:
       # reader can tell they were not skipped.
       - name: Audit regression suite (reproduced third-party PoCs)
         run: npm run test:audit
+      # --------------------------------------------------------------------
+      # Official A2A TCK — protocol compliance gate (P0).
+      # The TCK's main branch requires Python >= 3.15, unavailable here, so it
+      # is pinned to the last Python-3.11-compatible commit. scripts/tck.mjs
+      # boots the *real* built bridge behind a test-only Gherkin SUT adapter;
+      # every protocol assertion hits production code, and any JUnit failure
+      # or error fails the job. MANUAL requirements are reported, not scored.
+      # --------------------------------------------------------------------
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned A2A TCK
+        run: |
+          git clone --quiet https://github.com/a2aproject/a2a-tck.git "$RUNNER_TEMP/a2a-tck"
+          cd "$RUNNER_TEMP/a2a-tck"
+          git checkout --quiet 70f6f73c30208e80c889141907e094899e6e9f05
+          python -m venv .venv
+          .venv/bin/python -m pip install --quiet --upgrade pip
+          .venv/bin/python -m pip install --quiet -e .
+      - name: Official A2A TCK (MUST / JSON-RPC)
+        env:
+          A2A_TCK_DIR: ${{ runner.temp }}/a2a-tck
+        run: npm run test:tck
+      - name: Upload TCK reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tck-reports-linux
+          path: reports/tck/
+          if-no-files-found: warn
       - name: Upload release artefacts
         uses: actions/upload-artifact@v4
         with:

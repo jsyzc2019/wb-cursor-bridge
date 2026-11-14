@@ -38,6 +38,8 @@ export const A2A_ERROR = {
   RATE_LIMITED: -32050,
   /** The agent is at capacity; the request was not started. */
   TASK_REJECTED: -32006,
+  /** A2A v1.0: the requested A2A-Version is not supported by this interface. */
+  VERSION_NOT_SUPPORTED: -32009,
 } as const;
 
 export interface JsonRpcRequest {
@@ -239,7 +241,13 @@ export interface AgentCard {
    * A2A v1.0: protocol versions this agent implements, each with its endpoint.
    * Replaces the v0.3.0 top-level `protocolVersion`. Absent on v0.3.0 cards.
    */
-  supportedInterfaces?: Array<{ protocolVersion: string; url?: string }>;
+  supportedInterfaces?: Array<{
+    /** v1.0 transport binding identifier: JSONRPC | GRPC | HTTP+JSON. */
+    protocolBinding?: string;
+    protocolVersion: string;
+    url?: string;
+    tenant?: string;
+  }>;
   /** A2A v1.0: declared protocol extensions. Empty when none. */
   extensions?: unknown[];
 }

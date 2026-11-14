@@ -23,8 +23,20 @@ import type { Config } from '../config.js';
 import type { Logger } from '../logger.js';
 import type { Job, Tier } from '../types.js';
 import { badArgument, notFound } from '../errors.js';
-import { buildAgentCard, AGENT_OUTPUT_MODES } from './card.js';
+import { buildAgentCard, buildV1AgentCard, AGENT_OUTPUT_MODES, type AgentCardOptions } from './card.js';
 import { toV1Card, isV1, type A2AVersion } from './compat.js';
+import {
+  A2A_VERSION_HEADER,
+  VersionNotSupportedError,
+  resolveVersion,
+  mapV1Method,
+  fromV1Params,
+  wrapV1Result,
+  toV1StreamResponse,
+  toV1Task as toWireV1Task,
+  isV1Terminal,
+  type WireVersion,
+} from './v1.js';
 import { deriveSkills, resolveRoot, type SkillEntry } from './skills.js';
 import {
   messageToPrompt,
@@ -42,7 +54,7 @@ import {
   type JsonRpcRequest,
   type JsonRpcResponse,
   type Message,
-  type TaskEvent,
+  type Task,
 } from './types.js';
 
 const MAX_BODY_BYTES = 1_048_576; // 1 MiB: a task payload should never approach this.
@@ -149,7 +161,18 @@ export function startA2AServer(
   if (!config.a2aPort) return null;
 
   const skills: SkillEntry[] = deriveSkills(config.workspaceRoots, 'execute', config.a2aSkills ?? [], log);
+  /**
+   * Two independent discovery documents, deliberately kept separate:
+   *  - `/.well-known/agent.json` is the legacy v0.3.0 card (and the historical
+   *    `a2aProtocolVersion:'1.0'` static switch). Existing clients/tests read
+   *    this path, so its bytes never change.
+   *  - `/.well-known/agent-card.json` is the wire-compliant v1.0 card the
+   *    official A2A TCK discovers. It carries `supportedInterfaces[0]` with a
+   *    standard `protocolBinding`, which is what lets the TCK build a JSON-RPC
+   *    client at all (the 0.5.1 baseline had neither → 3 FAIL + 219 errors).
+   */
   let card: AgentCard | null = null;
+  let v1Card: Record<string, unknown> | null = null;
   const a2aVersion: A2AVersion = config.a2aProtocolVersion ?? '0.3.0';
 
   const cardUrl = (): string => {
@@ -164,6 +187,21 @@ export function startA2AServer(
   /** Base URL for the artifact-fetch endpoint, used to make FileParts reachable. */
   const artifactBaseUrl = (): string => `${cardUrl()}/artifacts`;
 
+  /** Shared AgentCard inputs for both discovery documents. */
+  const cardOptions = (): AgentCardOptions => ({
+    name: 'wb-cursor-bridge',
+    description:
+      'WorkBuddy ↔ Cursor interoperability bridge. Exposes the Cursor coding ' +
+      'sub-agent as an A2A agent: dispatch coding tasks, stream progress, and ' +
+      'receive artifacts (patches, reports) over the Agent2Agent protocol.',
+    version,
+    endpointUrl: cardUrl(),
+    skills,
+    authEnabled: Boolean(config.a2aAuthToken),
+    provider: PROVIDER,
+    documentationUrl: 'https://www.workbuddy.cn',
+  });
+
   let actualPort = config.a2aPort;
   const ratePerSec = config.a2aRateLimitPerSec ?? A2A_RATE_LIMIT_REFILL;
   const rateLimit = new PerClientRateLimiter(ratePerSec);
@@ -175,7 +213,15 @@ export function startA2AServer(
     // down, turning one bad request into a remote DoS. Catch, log, and answer
     // 500 instead.
     try {
-    const url = (req.url ?? '/').split('?')[0];
+    const rawUrl = (req.url ?? '/').split('?')[0];
+    /**
+     * The A2A v1.0 TCK JSON-RPC client takes its base_url from
+     * supportedInterfaces[0].url (e.g. http://host:port/a2a) and POSTs to "/",
+     * which httpx resolves to the trailing-slash path "/a2a/". Normalise that
+     * single alias to "/a2a" so auth, rate limiting and routing all behave
+     * exactly as they do for the canonical path.
+     */
+    const url = rawUrl === '/a2a/' ? '/a2a' : rawUrl;
 
     // When CORS origins are configured (opt-in), reflect the requesting origin
     // on every response so a browser-based console can talk to the bridge.
@@ -198,22 +244,17 @@ export function startA2AServer(
     }
 
     if (req.method === 'GET' && (url === '/.well-known/agent.json' || url === '/.well-known/agent-card.json')) {
+      if (url === '/.well-known/agent-card.json') {
+        // v1.0 TCK discovery path: always the strict, wire-compliant card.
+        // It is independent of the legacy `a2aProtocolVersion` static switch.
+        v1Card ??= buildV1AgentCard(cardOptions());
+        return sendJson(res, 200, v1Card);
+      }
+      // Legacy v0.3.0 discovery path, byte-for-byte unchanged. The static
+      // `a2aProtocolVersion:'1.0'` switch keeps its historical shallow
+      // toV1Card() behaviour here for the existing tests/clients.
       if (!card) {
-        const base = buildAgentCard({
-          name: 'wb-cursor-bridge',
-          description:
-            'WorkBuddy ↔ Cursor interoperability bridge. Exposes the Cursor coding ' +
-            'sub-agent as an A2A agent: dispatch coding tasks, stream progress, and ' +
-            'receive artifacts (patches, reports) over the Agent2Agent protocol.',
-          version,
-          endpointUrl: cardUrl(),
-          skills,
-          authEnabled: Boolean(config.a2aAuthToken),
-          provider: PROVIDER,
-          documentationUrl: 'https://www.workbuddy.cn',
-        });
-        // v1.0 moves protocolVersion off the card top level into
-        // supportedInterfaces; the rest of the card is unchanged.
+        const base = buildAgentCard(cardOptions());
         card = isV1(a2aVersion) ? toV1Card(base, cardUrl()) : base;
       }
       return sendJson(res, 200, card);
@@ -520,14 +561,58 @@ async function handlePost(
     return;
   }
 
+  // ---- A2A-Version negotiation (v1.0 wire vs legacy v0.3.0) --------------
+  // The official A2A TCK and real v1.0 clients send `A2A-Version: 1.0`
+  // together with PascalCase methods and an entirely different data model.
+  // Everything else keeps the legacy path byte-for-byte: no header, an empty
+  // header, or `0.3` all fall through to the original handlers. The static
+  // `a2aProtocolVersion` config switch is a separate, independent dimension —
+  // it only affects the legacy card / task serialisation, never this wire.
+  const wireParams = (parsed.params ?? {}) as Record<string, unknown>;
+  let wireVersion: WireVersion;
+  try {
+    wireVersion = resolveVersion(req.headers[A2A_VERSION_HEADER], wireParams, '0.3.0');
+  } catch (err) {
+    // VER-SERVER-002: an unsupported version MUST answer -32009, not crash
+    // and not silently process the request as 0.3.
+    sendJsonRpc(res, id, rpcError(a2aErrorCode(err), (err as Error)?.message ?? 'unsupported A2A-Version'));
+    return;
+  }
+
+  let innerReq: JsonRpcRequest = parsed;
+  if (wireVersion === '1.0') {
+    const innerMethod = mapV1Method(parsed.method);
+    if (innerMethod === null) {
+      // A v1.0 request carrying a non-spec method name gets a clean -32601.
+      sendJsonRpc(res, id, rpcError(A2A_ERROR.METHOD_NOT_FOUND, `method not found: ${parsed.method}`));
+      return;
+    }
+    innerReq = {
+      ...parsed,
+      method: innerMethod,
+      params: fromV1Params(innerMethod, wireParams),
+    };
+
+    // Input checks that must run against the *wire* params, before translation
+    // drops fields: CORE-SEND-003 (unsupported mediaType), wrong Content-Type,
+    // and CORE-MULTI-006 (mismatching contextId/taskId).
+    try {
+      assertV1WireInput(wireParams, mgr, req.headers['content-type']);
+    } catch (err) {
+      sendJsonRpc(res, id, rpcError(a2aErrorCode(err), (err as Error)?.message ?? 'invalid request'));
+      return;
+    }
+  }
+
   // A Request object with no `id` member is a JSON-RPC *notification*: the
-  // server MUST NOT reply to it. We still execute the side effect (e.g. a
-  // fire-and-forget message/send) but emit no response. Streaming methods
-  // cannot deliver anything to a notification, so they are simply ignored.
+  // server MUST NOT reply to it. Streaming methods cannot deliver anything to
+  // a notification, so they are simply ignored.
   const isNotification = parsed.id === undefined;
 
-  // Streaming methods speak SSE rather than a single JSON response.
-  const isStream = parsed.method === 'message/stream' || parsed.method === 'tasks/resubscribe';
+  // Streaming methods speak SSE rather than a single JSON response. The method
+  // is the *normalised* one, so v1.0 SendStreamingMessage / SubscribeToTask
+  // route here too.
+  const isStream = innerReq.method === 'message/stream' || innerReq.method === 'tasks/resubscribe';
   if (isStream) {
     if (isNotification) {
       // JSON-RPC says "do not reply", but HTTP still needs a terminated
@@ -537,13 +622,13 @@ async function handlePost(
       res.end();
       return;
     }
-    return handleStream(mgr, skills, config, log, parsed, req, res, artifactBase);
+    return handleStream(mgr, skills, config, log, innerReq, req, res, artifactBase, wireVersion);
   }
 
   if (isNotification) {
     // Best-effort side effect, no JSON-RPC reply - but still an HTTP reply.
-    await dispatch(mgr, skills, config, log, parsed, artifactBase).catch((err) =>
-      log.warn('a2a notification error', { method: parsed.method, err: String((err as Error)?.message) }),
+    await dispatchRequest(mgr, skills, config, log, innerReq, artifactBase, wireVersion).catch((err) =>
+      log.warn('a2a notification error', { method: innerReq.method, err: String((err as Error)?.message) }),
     );
     if (!res.writableEnded) {
       res.writeHead(202, { 'content-length': '0' });
@@ -563,17 +648,23 @@ async function handlePost(
   res.once('close', onClose);
 
   try {
-    const result = await dispatch(mgr, skills, config, log, parsed, artifactBase, disconnect.signal);
+    const result = await dispatchRequest(
+      mgr, skills, config, log, innerReq, artifactBase, wireVersion, disconnect.signal,
+    );
     if (disconnect.signal.aborted) {
       log.info('a2a client disconnected during a blocking call; task keeps running', {
-        method: parsed.method,
+        method: innerReq.method,
       });
       return;
     }
-    sendJsonRpc(res, id, { result });
+    // The v1.0 response envelope differs from the internal model: SendMessage
+    // becomes { task }, GetTask/CancelTask a v1.0 Task, ListTasks a
+    // ListTasksResponse. Translation happens once, here at the boundary.
+    const wireResult = wireVersion === '1.0' ? wrapV1Result(innerReq.method, result) : result;
+    sendJsonRpc(res, id, { result: wireResult });
   } catch (err) {
     const code = a2aErrorCode(err);
-    log.warn('a2a rpc error', { method: parsed.method, code, message: String((err as Error)?.message) });
+    log.warn('a2a rpc error', { method: innerReq.method, code, message: String((err as Error)?.message) });
     sendJsonRpc(res, id, rpcError(code, (err as Error)?.message ?? 'internal error'));
   } finally {
     res.off('close', onClose);
@@ -581,7 +672,11 @@ async function handlePost(
 }
 
 function a2aErrorCode(err: unknown): number {
+  // Version negotiation happens before dispatch, so this is a belt-and-braces
+  // mapping: an unsupported A2A-Version MUST map to -32009 (VER-SERVER-002).
+  if (err instanceof VersionNotSupportedError) return A2A_ERROR.VERSION_NOT_SUPPORTED;
   const code = (err as { code?: string })?.code;
+  if (code === 'E_PUSH_NOT_SUPPORTED') return A2A_ERROR.PUSH_NOT_SUPPORTED;
   if (code === 'E_NOT_FOUND') return A2A_ERROR.TASK_NOT_FOUND;
   // Capacity is a retryable condition with its own code, not an internal bug:
   // a client that sees -32603 has no way to know it should back off and retry.
@@ -595,6 +690,136 @@ function a2aErrorCode(err: unknown): number {
   return A2A_ERROR.INTERNAL_ERROR;
 }
 
+/* ------------------------------------------------- v1.0 request dispatch */
+
+/** Media types this agent can consume on a v1.0 wire (see the Agent Card's
+ * defaultOutputModes; defaultInputModes is text/plain). A Part carrying any
+ * other mediaType MUST be rejected with -32005 (CORE-SEND-003). */
+const V1_SUPPORTED_MEDIA_TYPES = new Set<string>([...AGENT_OUTPUT_MODES]);
+
+/**
+ * Validate v1.0 wire-level input that has no v0.3.0 counterpart. This runs
+ * against the *raw* params because fromV1Params() intentionally drops fields
+ * the internal model cannot represent (mediaType lives inside a flat Part,
+ * contextId/taskId live on the wire Message).
+ */
+function assertV1WireInput(
+  params: Record<string, unknown>,
+  mgr: JobManager,
+  contentType: string | undefined,
+): void {
+  // JSONRPC-FMT-002 / JSONRPC-SSE-002: a JSON-RPC body sent with a different
+  // Content-Type is a content negotiation failure, not a parse error.
+  if (typeof contentType === 'string' && contentType.length > 0 &&
+      !contentType.toLowerCase().includes('application/json')) {
+    throw new BridgeIncompatible(`unsupported Content-Type "${contentType}"; expected application/json`);
+  }
+  const rawMsg = params.message;
+  if (!rawMsg || typeof rawMsg !== 'object') return;
+  const msg = rawMsg as Record<string, unknown>;
+  for (const p of Array.isArray(msg.parts) ? msg.parts : []) {
+    if (!p || typeof p !== 'object') continue;
+    const mt = (p as Record<string, unknown>).mediaType;
+    if (typeof mt === 'string' && !V1_SUPPORTED_MEDIA_TYPES.has(mt)) {
+      throw new BridgeIncompatible(`unsupported media type "${mt}"`);
+    }
+  }
+  // CORE-MULTI-006: a message referencing a task MUST NOT carry a conflicting
+  // contextId.
+  const taskId = typeof msg.taskId === 'string' ? msg.taskId : undefined;
+  const contextId = typeof msg.contextId === 'string' ? msg.contextId : undefined;
+  if (taskId && contextId) {
+    const job = mgr.store.get(taskId);
+    if (job && (job.contextId ?? job.id) !== contextId) {
+      throw badArgument('contextId does not match the referenced task');
+    }
+  }
+}
+
+/**
+ * Dispatch a normalised request. Operations that exist only on the v1.0 wire
+ * (ListTasks, push-config CRUD, extended card) are answered here; the shared
+ * operations go through the legacy `dispatch()` unchanged. `wireVersion` is
+ * passed down so `toTask()` keeps the internal v0.3.0 model on the v1.0 path —
+ * the single v1.0 translation is `wrapV1Result()` at the transport boundary.
+ */
+async function dispatchRequest(
+  mgr: JobManager,
+  skills: SkillEntry[],
+  config: Config,
+  log: Logger,
+  req: JsonRpcRequest,
+  artifactBase: () => string,
+  wireVersion: WireVersion,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  if (wireVersion === '1.0') {
+    const params = (req.params ?? {}) as Record<string, unknown>;
+    switch (req.method) {
+      case 'tasks/list':
+        return listTasksV1(mgr, params, artifactBase);
+      case 'tasks/pushConfig/create':
+      case 'tasks/pushConfig/get':
+      case 'tasks/pushConfig/list':
+      case 'tasks/pushConfig/delete':
+        // CORE-CAP-001: the v1.0 card declares pushNotifications:false, so
+        // every push-config operation MUST answer -32003.
+        throw new BridgePushNotSupported();
+      case 'agent/extendedCard':
+        // CORE-CAP-003: no extendedAgentCard capability is declared.
+        throw new BridgeUnsupported('GetExtendedAgentCard is not supported by this agent');
+    }
+  }
+  return dispatch(mgr, skills, config, log, req, artifactBase, signal, wireVersion);
+}
+
+/**
+ * ListTasks for the v1.0 wire. Cursor pagination uses a numeric offset token;
+ * nextPageToken is an empty string on the final page (CORE-LIST-004). Tasks are
+ * sorted by status timestamp descending (CORE-LIST-003) and artifacts are
+ * omitted entirely unless includeArtifacts is true (CORE-LIST-005).
+ */
+function listTasksV1(
+  mgr: JobManager,
+  params: Record<string, unknown>,
+  artifactBase: () => string,
+): { tasks: Task[]; nextPageToken: string; pageSize: number; totalSize: number } {
+  const contextId = typeof params.contextId === 'string' ? params.contextId : undefined;
+  const status = typeof params.status === 'string' ? params.status : undefined;
+  const after = typeof params.statusTimestampAfter === 'string' ? params.statusTimestampAfter : undefined;
+  const includeArtifacts = params.includeArtifacts === true;
+  const historyLength = typeof params.historyLength === 'number' ? params.historyLength : undefined;
+
+  const stamp = (j: Job): string => j.inputRequiredAt ?? j.finishedAt ?? j.createdAt;
+  let jobs = mgr.store.list({ limit: Number.MAX_SAFE_INTEGER });
+  if (contextId) jobs = jobs.filter((j) => (j.contextId ?? j.id) === contextId);
+  if (status) jobs = jobs.filter((j) => toTaskState(j.status) === status);
+  jobs.sort((a, b) => (stamp(a) > stamp(b) ? -1 : stamp(a) < stamp(b) ? 1 : 0));
+  if (after) jobs = jobs.filter((j) => stamp(j) > after);
+
+  const totalSize = jobs.length;
+  const pageSize = typeof params.pageSize === 'number' && params.pageSize > 0
+    ? Math.min(Math.floor(params.pageSize), 1000)
+    : 50;
+  const token = typeof params.pageToken === 'string' ? params.pageToken : '';
+  const start = token ? Math.max(0, Number.parseInt(token, 10) || 0) : 0;
+  const page = jobs.slice(start, start + pageSize);
+  const nextPageToken = start + page.length < totalSize ? String(start + page.length) : '';
+
+  const base = artifactBase();
+  const tasks: Task[] = page.map((j) => {
+    const t = toTask(j, {
+      withHistory: typeof historyLength === 'number' && historyLength > 0,
+      historyLength,
+      artifactBase: base,
+      a2aVersion: '0.3.0',
+    });
+    if (!includeArtifacts) delete t.artifacts;
+    return t;
+  });
+  return { tasks, nextPageToken, pageSize, totalSize };
+}
+
 /* ------------------------------------------------------------- dispatch */
 
 async function dispatch(
@@ -605,9 +830,13 @@ async function dispatch(
   req: JsonRpcRequest,
   artifactBase: () => string,
   signal?: AbortSignal,
+  wireVersion: WireVersion = '0.3.0',
 ): Promise<unknown> {
   const params = (req.params ?? {}) as Record<string, unknown>;
-  const a2aVersion = config.a2aProtocolVersion ?? '0.3.0';
+  // On the v1.0 runtime path the engine must emit the *internal* 0.3 model:
+  // wrapV1Result() performs the one and only v1.0 translation. Applying the
+  // legacy static switch here too would double-translate the payload.
+  const a2aVersion = wireVersion === '1.0' ? '0.3.0' : (config.a2aProtocolVersion ?? '0.3.0');
 
   switch (req.method) {
     case 'message/send': {
@@ -895,9 +1124,10 @@ async function handleStream(
   httpReq: http.IncomingMessage,
   res: http.ServerResponse,
   artifactBase: () => string,
+  wireVersion: WireVersion = '0.3.0',
 ): Promise<void> {
   const params = (req.params ?? {}) as Record<string, unknown>;
-  const a2aVersion = config.a2aProtocolVersion ?? '0.3.0';
+  const a2aVersion = wireVersion === '1.0' ? '0.3.0' : (config.a2aProtocolVersion ?? '0.3.0');
   const controller = new AbortController();
   httpReq.on('close', () => controller.abort());
 
@@ -909,10 +1139,16 @@ async function handleStream(
       job = await createOrResume(mgr, skills, message);
       maybePush(mgr, job, params, config, log, controller.signal);
     } else {
-      // tasks/resubscribe
+      // tasks/resubscribe (v1.0 SubscribeToTask)
       const id = strParam(params, 'id', 'tasks/resubscribe.id');
       const existing = mgr.store.get(id);
       if (!existing) throw notFound(`unknown task ${id}`);
+      // STREAM-SUB-003: v1.0 MUST refuse a terminal task with -32004, answered
+      // as a plain JSON-RPC error *before* the SSE stream is opened — a
+      // streaming client treats an opened stream as a successful call.
+      if (wireVersion === '1.0' && isFinalState(toTaskState(existing.status))) {
+        throw new BridgeUnsupported('cannot subscribe to a task in a terminal state');
+      }
       job = existing;
     }
   } catch (err) {
@@ -929,12 +1165,30 @@ async function handleStream(
   res.write(`retry: 2000\n\n`);
 
   try {
+    const id = req.id ?? null;
+    // CORE-STREAM-003 / STREAM-SUB-001: a v1.0 task lifecycle stream MUST
+    // begin with a StreamResponse carrying the Task itself.
+    if (wireVersion === '1.0') {
+      const initial = toTask(job, {
+        withHistory: false,
+        artifactBase: artifactBase(),
+        a2aVersion: '0.3.0',
+      });
+      writeEvent(res, { task: toWireV1Task(initial) }, id);
+    }
     for await (const ev of subscribeTask(mgr, job.id, controller.signal, artifactBase(), a2aVersion)) {
       if (controller.signal.aborted) break;
-      writeEvent(res, ev, req.id ?? null);
-      // The generator now emits artifacts before the terminal status, so
-      // breaking here no longer truncates the deliverables.
-      if (ev.kind === 'status-update' && ev.final) break;
+      // v1.0 wraps each event in a StreamResponse ({ statusUpdate |
+      // artifactUpdate }) and drops `kind` / `final`, which the strict v1.0
+      // schema does not allow.
+      const payload = wireVersion === '1.0' ? toV1StreamResponse(ev) : ev;
+      writeEvent(res, payload, id);
+      // The generator emits artifacts before the terminal status, so breaking
+      // here no longer truncates the deliverables.
+      const terminal = wireVersion === '1.0'
+        ? isV1Terminal(ev)
+        : (ev.kind === 'status-update' && ev.final);
+      if (terminal) break;
     }
   } catch (err) {
     log.warn('a2a stream error', { taskId: job.id, err: String(err) });
@@ -947,10 +1201,11 @@ async function handleStream(
  * A2A streams SSE frames that are JSON-RPC *responses*, not bare events: the
  * event travels in `result` and the response echoes the request id. Emitting
  * the bare event meant a spec-compliant client saw `undefined.result` and
- * silently dropped every update.
+ * silently dropped every update. On the v1.0 wire `result` is a StreamResponse
+ * (or the leading `{ task }` envelope); on 0.3 it is the raw TaskEvent.
  */
-function writeEvent(res: http.ServerResponse, ev: TaskEvent, id: string | number | null): void {
-  res.write(`data: ${JSON.stringify({ jsonrpc: JsonRpcVersion, id, result: ev })}\n\n`);
+function writeEvent(res: http.ServerResponse, result: unknown, id: string | number | null): void {
+  res.write(`data: ${JSON.stringify({ jsonrpc: JsonRpcVersion, id, result })}\n\n`);
 }
 
 /** Serve a captured artifact (patch / report) file for a task. */
@@ -1143,4 +1398,14 @@ class BridgeIncompatible extends Error {
     this.name = 'BridgeIncompatible';
   }
   code = 'E_INCOMPATIBLE' as const;
+}
+
+/** CORE-CAP-001: the v1.0 card declares pushNotifications:false, so push-config
+ * operations MUST answer -32003 rather than pretending to store a webhook. */
+class BridgePushNotSupported extends Error {
+  constructor() {
+    super('push notifications are not supported by this agent');
+    this.name = 'BridgePushNotSupported';
+  }
+  code = 'E_PUSH_NOT_SUPPORTED' as const;
 }
