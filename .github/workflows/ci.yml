@@ -37,6 +37,12 @@ jobs:
       # verify = lint + typecheck + unit/e2e/admin/a2a/hardening/audit + stress
       #          + fault + release build
       - run: npm run verify
+      # P4: the Agent Card is the trust anchor another agent reads first. This
+      # zero-dependency gate builds both cards from the production builders and
+      # fails on malformed fields, unknown bindings or over-claimed capabilities
+      # (e.g. declaring pushNotifications without a delivery contract).
+      - name: Agent Card static scan (P4)
+        run: npm run scan:card
       - name: End-to-end real-run empirical (real dist binary + fake-agent)
         run: npm run verify:e2e
       # The evidence-pack regressions live in test/audit-*.test.mjs and are part
@@ -45,12 +51,18 @@ jobs:
       - name: Audit regression suite (reproduced third-party PoCs)
         run: npm run test:audit
       # --------------------------------------------------------------------
-      # Official A2A TCK — protocol compliance gate (P0).
+      # Official A2A TCK — protocol compliance gate (P0 + multi-binding).
       # The TCK's main branch requires Python >= 3.15, unavailable here, so it
       # is pinned to the last Python-3.11-compatible commit. scripts/tck.mjs
       # boots the *real* built bridge behind a test-only Gherkin SUT adapter;
       # every protocol assertion hits production code, and any JUnit failure
       # or error fails the job. MANUAL requirements are reported, not scored.
+      #
+      # 0.6.0 gates BOTH declared bindings in one run: JSON-RPC + HTTP+JSON.
+      # GRPC is deliberately NOT declared on the Agent Card and is NOT run
+      # here (capability honesty: 65 grpc cases stay skipped, see
+      # docs/a2a-v1-multibinding.md). pretest:tck rebuilds dist/ first so the
+      # TCK never reads a stale card and reports a false green.
       # --------------------------------------------------------------------
       - uses: actions/setup-python@v5
         with:
@@ -63,9 +75,10 @@ jobs:
           python -m venv .venv
           .venv/bin/python -m pip install --quiet --upgrade pip
           .venv/bin/python -m pip install --quiet -e .
-      - name: Official A2A TCK (MUST / JSON-RPC)
+      - name: Official A2A TCK (MUST / JSON-RPC + HTTP+JSON)
         env:
           A2A_TCK_DIR: ${{ runner.temp }}/a2a-tck
+          TCK_TRANSPORT: jsonrpc,http_json
         run: npm run test:tck
       - name: Upload TCK reports
         if: always()
@@ -127,6 +140,12 @@ jobs:
         # no failing test named. 12 minutes is ~4x the observed worst case.
         timeout-minutes: 12
         run: npm test
+      # Same P4 card-honesty gate on Windows; the cards are built by the same
+      # TypeScript sources, so a platform-specific regression is still worth
+      # catching where the release artefact is produced.
+      - name: Agent Card static scan (P4)
+        shell: pwsh
+        run: npm run scan:card
       - name: Stress and fault suites
         shell: pwsh
         run: |

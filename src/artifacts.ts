@@ -79,3 +79,121 @@ export function filePart(absPath: string, mimeType: string, filename: string): A
     file: { name: filename, mimeType, uri: `file://${absPath}`, bytes, bytes_inline: bytesInline },
   };
 }
+
+/* --------------------------------------------------------------------- P2 */
+
+/**
+ * Cost/usage summary for a task. Always derivable from fields the bridge
+ * already persists; `usage` is populated when the worker reported token or
+ * monetary usage (e.g. Cursor's result `usage` object) in metadata.
+ */
+export interface StructuredCost {
+  durationMs?: number;
+  model?: string;
+  toolCallCount: number;
+  transcriptEntryCount: number;
+  eventCount: number;
+  usage?: unknown;
+}
+
+export interface TranscriptEntry {
+  semantic: 'thinking' | 'plan';
+  seq: number;
+  ts: string;
+  text: string;
+}
+
+export interface ToolCallEntry {
+  seq: number;
+  ts: string;
+  detail: unknown;
+}
+
+/** Heuristic plan marker. Deliberately conservative: everything else is thinking. */
+const PLAN_HINT = /\b(?:plan|todo|steps?\s*\d|phase\s*\d|计划|方案|步骤)\b/i;
+
+export function classifyTranscript(job: Job): TranscriptEntry[] {
+  const out: TranscriptEntry[] = [];
+  for (const ev of job.events ?? []) {
+    if (ev.type !== 'assistant' || typeof ev.text !== 'string' || !ev.text.trim()) continue;
+    out.push({
+      semantic: PLAN_HINT.test(ev.text) ? 'plan' : 'thinking',
+      seq: ev.seq,
+      ts: ev.ts,
+      text: ev.text,
+    });
+  }
+  return out;
+}
+
+export function structuredCost(job: Job, transcriptCount: number, toolCount: number): StructuredCost {
+  const cost: StructuredCost = {
+    durationMs: job.durationMs,
+    model: job.model,
+    toolCallCount: toolCount,
+    transcriptEntryCount: transcriptCount,
+    eventCount: job.events?.length ?? 0,
+  };
+  if (job.metadata?.usage !== undefined) cost.usage = job.metadata.usage;
+  return cost;
+}
+
+/**
+ * P2: derive protocol-level structured artifacts from the job's event stream.
+ *
+ * The worker's raw stream is a flat event log; A2A clients need semantic units
+ * (thinking/plan transcript, tool calls, cost, permission request) as named,
+ * addressable artifacts. This is a pure derivation — `buildArtifacts()` (the
+ * deliverable artefacts, whose shape and count are locked by unit tests) is
+ * intentionally left untouched.
+ *
+ * Also deliberately does NOT introduce worker-initiated work: a permission
+ * request is a *pause* (`input-required`) the caller answers, never an action
+ * the worker schedules on its own.
+ */
+export function buildStructuredArtifacts(job: Job): Artifact[] {
+  const out: Artifact[] = [];
+  const transcript = classifyTranscript(job);
+  const toolCalls: ToolCallEntry[] = (job.events ?? [])
+    .filter((ev) => ev.type === 'tool')
+    .map((ev) => ({ seq: ev.seq, ts: ev.ts, detail: ev.detail }));
+
+  if (transcript.length > 0) {
+    out.push({
+      artifactId: `${job.id}-transcript`,
+      name: 'transcript',
+      parts: [{ kind: 'data', data: { entries: transcript } }],
+    });
+  }
+  if (toolCalls.length > 0) {
+    out.push({
+      artifactId: `${job.id}-toolcalls`,
+      name: 'toolCalls',
+      parts: [{ kind: 'data', data: { calls: toolCalls } }],
+    });
+  }
+  out.push({
+    artifactId: `${job.id}-cost`,
+    name: 'cost',
+    parts: [{ kind: 'data', data: structuredCost(job, transcript.length, toolCalls.length) }],
+  });
+  if (job.status === 'input-required' && job.pendingInput) {
+    out.push({
+      artifactId: `${job.id}-permission`,
+      name: 'permissionRequest',
+      parts: [
+        { kind: 'text', text: job.pendingInput },
+        {
+          kind: 'data',
+          data: {
+            state: 'input-required',
+            question: job.pendingInput,
+            at: job.inputRequiredAt,
+            resumeWith: `message/send with taskId=${job.id} and the same contextId`,
+          },
+        },
+      ],
+    });
+  }
+  return out;
+}

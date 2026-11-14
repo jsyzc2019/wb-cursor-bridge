@@ -93,6 +93,15 @@ const cfg = {
   logLevel: 'info',
   defaultTimeoutSec: 60,
   maxConcurrency: 8,
+  // Push delivery is gated on an authenticated A2A surface. The TCK client is
+  // unauthenticated, so the SUT adapter injects this token on forwarded
+  // requests; production defaults are untouched.
+  a2aAuthToken: 'tck-internal-token',
+  // The TCK webhook receiver listens on loopback (--webhook-host defaults to
+  // "localhost"). Explicit operator-style allowlisting is the same mechanism a
+  // real deployment would use; the default (no allowlist) still blocks
+  // loopback/private targets.
+  a2aPushUrlAllowlist: ['localhost', '127.0.0.1'],
 };
 const cfgPath = path.join(stateDir, 'config.json');
 fs.writeFileSync(cfgPath, JSON.stringify(cfg));
@@ -115,7 +124,7 @@ bridge.stdout.on('data', () => {});
 
 let shim;
 try {
-  shim = await startTckSut({ bridgePort, shimPort });
+  shim = await startTckSut({ bridgePort, shimPort, authToken: cfg.a2aAuthToken });
 } catch (err) {
   console.error('[tck] SUT adapter failed to start:', String(err));
   try { process.kill(-bridge.pid, 'SIGKILL'); } catch { /* ignore */ }

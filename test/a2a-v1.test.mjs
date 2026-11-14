@@ -185,7 +185,7 @@ test('v1: discovery keeps two independent documents', async () => {
     assert.ok(iface.url.endsWith('/a2a'));
     // strict Agent Interface schema: exactly these four keys
     assert.deepEqual(Object.keys(iface).sort(), ['protocolBinding', 'protocolVersion', 'url']);
-    assert.equal(card.capabilities.pushNotifications, false, 'v1.0 push is honestly disabled');
+    assert.equal(card.capabilities.pushNotifications, true, 'v1.0 push CRUD + delivery is implemented');
     assert.equal(card.capabilities.streaming, true);
     assert.equal(card.capabilities.extendedAgentCard, undefined);
     assert.equal(card.capabilities.stateTransitionHistory, undefined);
@@ -269,10 +269,48 @@ test('v1: version negotiation (unsupported, empty, patch, 0.3)', async () => {
   });
 });
 
+test('v1: push notification config CRUD is live and delete is idempotent', async () => {
+  await withServer({}, async ({ base }) => {
+    const taskId = 'tck-task-1';
+    const created = await rpc(base, 'CreateTaskPushNotificationConfig', {
+      task_id: taskId,
+      id: 'cfg-1',
+      url: 'https://example.com/hook',
+      authentication: { scheme: 'Bearer', credentials: 'secret' },
+    }, { headers: V1 });
+    assert.ok(created.body.result, `create failed: ${JSON.stringify(created.body)}`);
+    assert.equal(created.body.result.id, 'cfg-1');
+    assert.equal(created.body.result.url, 'https://example.com/hook');
+    assert.equal(created.body.result.taskId, taskId);
+
+    const got = await rpc(base, 'GetTaskPushNotificationConfig', { task_id: taskId, id: 'cfg-1' }, { headers: V1 });
+    assert.equal(got.body.result.id, 'cfg-1');
+    assert.equal(got.body.result.authentication.credentials, 'secret');
+
+    const listed = await rpc(base, 'ListTaskPushNotificationConfigs', { task_id: taskId }, { headers: V1 });
+    assert.ok(listed.body.result.configs.some((c) => c.id === 'cfg-1'));
+    assert.equal(listed.body.result.nextPageToken, '');
+
+    const missing = await rpc(base, 'GetTaskPushNotificationConfig', { task_id: taskId, id: 'nope' }, { headers: V1 });
+    assert.ok(missing.body.error, 'nonexistent config must error');
+
+    const del = await rpc(base, 'DeleteTaskPushNotificationConfig', { task_id: taskId, id: 'cfg-1' }, { headers: V1 });
+    assert.ok(del.body.result);
+    const del2 = await rpc(base, 'DeleteTaskPushNotificationConfig', { task_id: taskId, id: 'cfg-1' }, { headers: V1 });
+    assert.ok(del2.body.result, 'second delete must be idempotent');
+    const afterDel = await rpc(base, 'GetTaskPushNotificationConfig', { task_id: taskId, id: 'cfg-1' }, { headers: V1 });
+    assert.ok(afterDel.body.error, 'config must be gone after delete');
+
+    // SSRF gate still applies at config creation time.
+    const ssrf = await rpc(base, 'CreateTaskPushNotificationConfig', {
+      task_id: taskId, id: 'bad', url: 'http://169.254.169.254/latest/meta-data',
+    }, { headers: V1 });
+    assert.ok(ssrf.body.error, 'link-local push target must be rejected');
+  });
+});
+
 test('v1: capability gates and error-code mapping', async () => {
   await withServer({}, async ({ base }) => {
-    const push = await rpc(base, 'CreateTaskPushNotificationConfig', { task_id: 't', url: 'https://example.com' }, { headers: V1 });
-    assert.equal(push.body.error.code, -32003, 'CORE-CAP-001');
     const ext = await rpc(base, 'GetExtendedAgentCard', {}, { headers: V1 });
     assert.equal(ext.body.error.code, -32004, 'CORE-CAP-003');
     const missing = await rpc(base, 'GetTask', { id: 'does-not-exist' }, { headers: V1 });

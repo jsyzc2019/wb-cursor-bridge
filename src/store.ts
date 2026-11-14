@@ -13,10 +13,17 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Job, JobEvent, JobStatus } from './types.js';
+import type { Job, JobCheckpoint, JobEvent, JobStatus } from './types.js';
 import { notFound } from './errors.js';
 import type { Logger } from './logger.js';
 import { currentInstanceId, pidAlive } from './util/instance.js';
+
+/**
+ * P3: how long a `running` job's lease stays valid. A live lease is never
+ * reclaimed and never re-run by another instance. Renewed on every `touch()`
+ * while the worker is alive, so a healthy long task is not mistaken for a crash.
+ */
+export const LEASE_TTL_MS = 60_000;
 
 export interface StoreLimits {
   maxJobs: number;
@@ -99,6 +106,11 @@ type PersistedJob = Pick<
   | 'pid'
   | 'result'
   | 'cursor'
+  | 'requestKey'
+  | 'checkpoint'
+  | 'leaseOwner'
+  | 'leaseExpiresAt'
+  | 'sideEffects'
 > & {
   /**
    * Instance that wrote this record.
@@ -178,10 +190,14 @@ export class JobStore {
     for (const meta of parsed.jobs ?? []) {
       let status: JobStatus = meta.status;
       if (meta.status === 'running') {
+        // P3: reconciliation is driven by whether the owning PROCESS is alive.
+        // A hard kill leaves behind an *unexpired* lease, so a live lease is
+        // NOT proof of life; conversely a stalled writer can miss a heartbeat
+        // while its process is still right there, so an expired lease is NOT
+        // proof of death. `ownerStillAlive` is authoritative. The lease fields
+        // are persisted for cross-instance diagnostics and are always cleared
+        // on an orphaned job, so recovery can never re-run it (no second run).
         if (this.ownerStillAlive(meta.owner)) {
-          // A sibling bridge on this host is running it right now. Marking it
-          // orphaned would make the two instances rewrite each other's status
-          // on every persist.
           status = 'running';
         } else {
           status = 'orphaned';
@@ -191,6 +207,10 @@ export class JobStore {
       this.jobs.set(meta.id, {
         ...meta,
         status,
+        // An orphaned job has no owner and holds no lease; it is never re-run.
+        ...(status === 'orphaned'
+          ? { leaseOwner: undefined, leaseExpiresAt: undefined }
+          : {}),
         events: [],
         cursor: meta.cursor ?? 0,
       });
@@ -202,6 +222,13 @@ export class JobStore {
   }
 
   create(job: Job): Job {
+    // P3: the lease is committed in the SAME atomic write as the job's initial
+    // state. A hard kill immediately after create() can never leave behind a
+    // running job without a lease that reconciliation could misjudge.
+    if (job.status === 'running' || job.status === 'input-required') {
+      job.leaseOwner = this.instanceId;
+      job.leaseExpiresAt = new Date(Date.now() + LEASE_TTL_MS).toISOString();
+    }
     this.jobs.set(job.id, job);
     this.owned.add(job.id);
     this.evict();
@@ -209,6 +236,46 @@ export class JobStore {
     // job must still be discoverable on the next boot and marked orphaned.
     this.persist();
     return job;
+  }
+
+  /** P3: resolve an idempotent submission to the job it already created. */
+  findByRequestKey(key: string | undefined): Job | undefined {
+    if (!key) return undefined;
+    for (const j of this.jobs.values()) {
+      if (j.requestKey === key) return j;
+    }
+    return undefined;
+  }
+
+  /**
+   * P3: atomically commit a checkpoint transition together with a field patch
+   * in ONE `persist()`. A phase must never be persisted separately from the
+   * state it describes, or a crash could tear the two apart and recovery would
+   * either replay a side effect or lose a commit.
+   */
+  checkpoint(job: Job, phase: JobCheckpoint, patch: Partial<Job> = {}): void {
+    Object.assign(job, patch, { checkpoint: phase });
+    const live = job.status === 'running' || job.status === 'input-required';
+    if (live) {
+      job.leaseOwner = this.instanceId;
+      job.leaseExpiresAt = new Date(Date.now() + LEASE_TTL_MS).toISOString();
+    } else {
+      // Settled / orphaned jobs hold no lease and cannot be re-run.
+      job.leaseOwner = undefined;
+      job.leaseExpiresAt = undefined;
+    }
+    this.persist();
+  }
+
+  /** P3: record a side effect as committed; recovery never replays it. */
+  markSideEffect(job: Job, phase: string): void {
+    (job.sideEffects ??= {})[phase] = new Date().toISOString();
+    this.persist();
+  }
+
+  /** P3: true when a side effect was already committed (or may have been). */
+  hasSideEffect(job: Job, phase: string): boolean {
+    return Boolean(job.sideEffects?.[phase]);
   }
 
   get(id: string): Job | undefined {
@@ -313,6 +380,15 @@ export class JobStore {
   /** Persisted index is the durable record; writes are batched. */
   touch(): void {
     this.dirty = true;
+    // P3: renew the lease of our own live jobs on every batched write, so a
+    // healthy long-running worker is never mistaken for a crash on restart.
+    const expiry = new Date(Date.now() + LEASE_TTL_MS).toISOString();
+    for (const j of this.jobs.values()) {
+      if (this.owned.has(j.id) && (j.status === 'running' || j.status === 'input-required')) {
+        j.leaseOwner = this.instanceId;
+        j.leaseExpiresAt = expiry;
+      }
+    }
     if (this.flushTimer) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
@@ -439,6 +515,13 @@ export class JobStore {
         // restart; resetting to 0 made every incremental poller silently miss
         // every event of every later task.
         cursor: j.cursor,
+        // P3: idempotency identity, checkpoint phase, lease and committed side
+        // effects MUST travel in the SAME atomic write as the status.
+        requestKey: j.requestKey,
+        checkpoint: j.checkpoint,
+        leaseOwner: j.leaseOwner,
+        leaseExpiresAt: j.leaseExpiresAt,
+        sideEffects: j.sideEffects,
         owner: this.instanceId,
       })),
     };
