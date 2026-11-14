@@ -1,5 +1,44 @@
 # 更新日志
 
+## 0.6.0 — A2A v1.0 完整契约与多绑定合规
+
+在 P0（v0.3.0 → v1.0 wire 合规 + 官方 TCK MUST 门禁）之后，完成 P1–P5、
+完整 v1.0 push notification 契约、以及 HTTP+JSON 第二绑定。**0.3 路径零改动**，
+**零新增运行时依赖**，仍产单文件 win-x64 离线包。
+
+### 协议与合规
+
+- **完整 v1.0 push**：`src/a2a/push.ts` 实现 `TaskPushNotificationConfig` CRUD、
+  `StreamResponse` webhook delivery、`authentication.scheme/credentials`、
+  SSRF allowlist / DNS / `redirect:'manual'`、分页与幂等删除；卡片
+  `pushNotifications` 由 `false` 改为 `true`。官方 TCK `PUSH-*` 10 项全 PASS。
+- **HTTP+JSON 绑定**：`src/a2a/rest.ts` 零依赖实现 REST route、AIP-193 错误、
+  `A2A-Version` 协商、媒体类型校验、bare ProtoJSON、SSE `StreamResponse`、
+  terminal `SubscribeToTask` 拒绝；`supportedInterfaces` 追加 `HTTP+JSON`，
+  `JSONRPC` 仍为首选。
+- **官方 TCK 双 transport 门禁**：`TCK_TRANSPORT=jsonrpc,http_json npm run test:tck`
+  → `136 passed / 0 failures / 0 errors`（`jsonrpc 76/83`、`http_json 72/78`）；
+  `pretest:tck` 先重建 `dist/`，杜绝 stale card 假绿；CI 接入双绑定门禁。
+- **capability honesty**：`GRPC` 未端到端实现，卡片**不声明**、TCK 不跑、
+  65 个 skip 不计入通过。交付 `scripts/poc-a2a-grpc.mjs` 零依赖可行性探针
+  （`node:http2` + 手写 protobuf wire，官方 TCK 的 Python grpcio stub 真实解析通过）
+  与 `docs/a2a-v1-multibinding.md` 评估；MANUAL / NOT TESTED / SKIPPED 如实列出。
+
+### 架构与治理
+
+- **P1 单 Action 层**：`src/actions/`，MCP 与 A2A 从同一 registry 派生，消除漂移。
+- **P2 结构化产物**：`thinking` / `plan` / `diff` / `cost` / `tool-call` /
+  `permission-request` 落到 artifact / status / metadata；`contextId` 续跑显式化。
+- **P3 幂等恢复**：`requestKey` 去重、原子 checkpoint、lease metadata、
+  side effect markers；恢复以 owner 进程存活为权威。
+- **P4 治理**：OWASP Agentic Top 10 2026 矩阵 + 零依赖 Agent Card 扫描门禁（CI）。
+- **P5 评估**：MCP SDK v2 / SEP-2663 Tasks 对齐 PoC；决策「本版本不升级 SDK」。
+
+### 验证
+
+`npm run verify` 8 阶段、`scan:card`、`test:card-scan`(12)、`poc:mcp-tasks`(7/7)、
+`poc:a2a-grpc`(3/3)、默认 TCK、双 transport TCK、`build:release` 全绿。
+
 ## 0.5.1 — 验证回路提速（无产品代码变更）
 
 外部审计交付后，日常回路是「改一版 → 跑 verify → 推 PR → 等 CI」，这一步实测太慢，

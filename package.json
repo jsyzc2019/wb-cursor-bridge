@@ -1,6 +1,6 @@
 {
   "name": "wb-cursor-bridge",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "MCP bridge that exposes the Cursor CLI as a governed sub-agent to WorkBuddy.",
   "type": "module",
   "license": "MIT",

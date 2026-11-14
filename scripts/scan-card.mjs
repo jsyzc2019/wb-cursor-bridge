@@ -17,7 +17,14 @@
  *
  * Exit 0 = clean, 1 = findings. CI treats any finding as a failure.
  */
+import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+
+// Read the version from package.json so the scan gate never drifts from the
+// release version (the card built here must describe the shipping build).
+const PKG_VERSION = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+).version;
 
 const V1_CARD_ALLOWED = new Set([
   'name', 'description', 'version', 'capabilities', 'defaultInputModes',
@@ -191,7 +198,7 @@ export async function buildProductionCards() {
   const options = {
     name: 'wb-cursor-bridge',
     description: 'Governed Cursor CLI sub-agent exposed over MCP + A2A',
-    version: '0.5.1',
+    version: PKG_VERSION,
     endpointUrl: 'http://127.0.0.1:0/a2a',
     skills,
     authEnabled: true,
