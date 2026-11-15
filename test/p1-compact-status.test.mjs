@@ -24,10 +24,12 @@ import { fixedJob, baseConfig } from './fixtures/p1-fixture.mjs';
 import { rmrf } from './tmp.mjs';
 
 /** Frozen v0.6.0 text — exactly what MCP's ok() injects into the prompt. */
-const GOLDEN = fs.readFileSync(
-  new URL('./fixtures/p1-v060-jobview.golden.json', import.meta.url),
-  'utf8',
-);
+const GOLDEN = fs
+  .readFileSync(new URL('./fixtures/p1-v060-jobview.golden.json', import.meta.url), 'utf8')
+  // Defensive: .gitattributes pins the fixture to LF, but a checkout with
+  // core.autocrlf=true would otherwise turn it into CRLF and make this gate
+  // fail on Windows (CI Run #17). The comparison stays byte-exact in LF terms.
+  .replace(/\r\n/g, '\n');
 
 const serialise = (view) => JSON.stringify(view, null, 2);
 

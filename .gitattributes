@@ -1,3 +1,8 @@
 # Shell entry points must keep LF: a CRLF shebang breaks exec on POSIX.
 *.sh  text eol=lf
 *.ps1 text eol=crlf
+# Frozen byte-level golden fixtures must stay LF on every platform. Windows
+# runners default to core.autocrlf=true; without this rule the v0.6.0 golden
+# text is checked out as CRLF and the byte-for-byte comparison in
+# test/p1-compact-status.test.mjs fails (CI Run #17).
+test/fixtures/*.json text eol=lf
