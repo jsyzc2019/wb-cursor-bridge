@@ -202,4 +202,19 @@ export interface JobView {
   cursor: number;
   /** Convenience hint for the caller. */
   next?: string;
+
+  /* ------------------------------------------- P1: opt-in compact poll view */
+
+  /**
+   * Fields omitted from an incremental (`since > 0`) poll because they were
+   * unchanged and larger than the omit threshold. Only ever present when the
+   * `compactStatus` switch is on; absence means the full view was returned.
+   */
+  omitted?: Array<'result' | 'artifacts'>;
+  /** JSON-serialised byte size of each omitted field. */
+  omittedBytes?: { result?: number; artifacts?: number };
+  /** How to retrieve the complete view (a `since=0` call). */
+  fullView?: string;
+  /** True when this response is a compact incremental view. */
+  compact?: boolean;
 }

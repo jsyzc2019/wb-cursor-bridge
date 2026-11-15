@@ -1,5 +1,32 @@
 # 更新日志
 
+## 0.6.1 — 轮询增量视图（opt-in，默认关闭）
+
+**默认行为零变化**：`CURSOR_BRIDGE_COMPACT_STATUS` 默认 `false`，关闭时
+`cursor_status` 响应与 v0.6.0 **字节级一致**；置回 `false` 即时回滚，无需发版。
+本版本为向后兼容的补丁级新增，不改任何 wire 契约、工具定义或 A2A 表面。
+
+- **背景**：P0 实测（见 `wb-cursor-bridge-token-efficiency-plan.md`、
+  `token-baseline/P0-baseline-report.md`）显示信息密集会话有 71.9% 的注入字节属于
+  「同一份内容跨轮重复」——约 205 KB 的 `result` 被连续 6+ 轮
+  `cursor_status(since>0)` 原样回传，累计 1.64 MB；`maxResultBytes`（2 MiB 单次上限）
+  管不住跨轮重复。
+- **新增开关** `CURSOR_BRIDGE_COMPACT_STATUS`（默认 `false`）。仅当开关开启、
+  `since>0`、且目标字段 JSON 体积 > 1 KiB 时才省略 `result` / `artifacts`，
+  响应纯追加 `omitted` / `omittedBytes` / `fullView` / `compact`；短任务零感知。
+- **全文通道**：`cursor_status` 不传 `since` 或 `since=0` 始终返回完整 JobView，
+  与 v0.6.0 字节级一致；零新增工具、零 schema 改动、零 A2A / 持久化改动。
+- **兼容性**：沿用 v1.0 `A2A-Version` 的「默认不变 + 显式选择才生效」范式；
+  配置置 `false` 即时字节级回滚。新增 `test/p1-compact-status.test.mjs`，
+  首项为开关关闭时的黄金字节对比。
+- **否决**（见 `wb-cursor-bridge-p1-contract-review.md` §4）：P1-4 紧凑序列化、
+  P1-2 产物外链（v1.0 已天然规避）、改默认值、新增工具、改 `inputSchema`、
+  有损压缩、gRPC binding / MCP SDK v2 迁移。
+- **门禁**：`npm run verify` 8 阶段、官方 TCK 双 transport、card scan、
+  MCP / gRPC PoC、`build:release` 全绿；发布包 payload 清单不变，`VERSION=0.6.1`。
+- **发布**：`v0.6.1` annotated tag + GitHub Release；win-x64 产物由该 tag 对应
+  commit 的时间戳（`SOURCE_DATE_EPOCH`）可复现构建，digest 见 Release 页面。
+
 ## 0.6.0 — A2A v1.0 完整契约与多绑定合规
 
 在 P0（v0.3.0 → v1.0 wire 合规 + 官方 TCK MUST 门禁）之后，完成 P1–P5、

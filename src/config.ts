@@ -81,10 +81,18 @@ export interface Config {
    * (`sk-live-...` was readable by any agent that printed its environment).
    */
   envPassthrough: string[];
+  /**
+   * Opt-in compact `cursor_status` polling view. Default false: the MCP
+   * response stays byte-for-byte identical to v0.6.0. When enabled, an
+   * incremental poll (`since > 0`) may omit large unchanged fields. The full
+   * view is always one `since=0` call away. See README / CHANGELOG.
+   */
+  compactStatus: boolean;
 }
 
 type FileConfig = Partial<{
   cursorBin: string;
+  compactStatus?: boolean;
   workspaceRoots: string[] | string;
   stateDir: string;
   defaultTimeoutSec: number;
@@ -374,6 +382,11 @@ export function loadConfig(): Config {
       'CURSOR_BRIDGE_FORCE_WORKTREE',
       process.env.CURSOR_BRIDGE_FORCE_WORKTREE,
       file.forceWorktree,
+    ),
+    compactStatus: bool(
+      'CURSOR_BRIDGE_COMPACT_STATUS',
+      process.env.CURSOR_BRIDGE_COMPACT_STATUS,
+      file.compactStatus,
     ),
     maxResultBytes: num(
       'CURSOR_BRIDGE_MAX_RESULT_BYTES',

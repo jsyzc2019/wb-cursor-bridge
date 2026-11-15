@@ -14,7 +14,7 @@ function legacyCard(overrides = {}) {
     protocolVersion: '0.3.0',
     name: 'wb-cursor-bridge',
     description: 'governed sub-agent',
-    version: '0.6.0',
+    version: '0.6.1',
     skills: [{ id: 'cursor.run', name: 'Run' }],
     capabilities: { streaming: true, pushNotifications: true, stateTransitionHistory: true },
     ...overrides,
@@ -25,7 +25,7 @@ function v1Card(overrides = {}) {
   return {
     name: 'wb-cursor-bridge',
     description: 'governed sub-agent',
-    version: '0.6.0',
+    version: '0.6.1',
     capabilities: { streaming: true, pushNotifications: false },
     defaultInputModes: ['text/plain'],
     defaultOutputModes: ['text/plain'],

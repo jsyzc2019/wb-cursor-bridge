@@ -183,6 +183,7 @@ curl -s -X POST http://127.0.0.1:<a2aPort>/a2a \
 | `maxLiveJobs` / `CURSOR_BRIDGE_MAX_LIVE_JOBS` | `20` | 「活任务」上限：`running` + `input-required`。只算历史条的 `maxJobs` 拦不住暂停任务堆积 |
 | `inputRequiredTtlSec` / `CURSOR_BRIDGE_INPUT_TTL_SEC` | `86400` | `input-required` 任务的存活期，过期转 `cancelled` 并清理产物（`[60, 30d]`） |
 | `maxEventBytes` / `CURSOR_BRIDGE_MAX_EVENT_BYTES` | `4 MiB` | 单任务事件环的**字节**预算。`maxEventsPerJob` 只限条数，2000 条 × 1 MiB 仍可撑爆内存 |
+| `compactStatus` / `CURSOR_BRIDGE_COMPACT_STATUS` | `false` | **opt-in 轮询增量视图**。开启后 `cursor_status` 带 `since>0` 的轮询会省略「已完整发过、且 > 1 KiB」的 `result` / `artifacts`，并追加 `omitted` / `omittedBytes` / `fullView` / `compact`；`pendingInput` / `next` / `events` / `cursor` 始终保留。**全文始终用 `since=0`（或不传 `since`）取回**，无需新增工具。默认关闭时响应与 v0.6.0 字节级一致；置回 `false` 即时回滚，无需发版 |
 | `envPassthrough` / `CURSOR_BRIDGE_ENV_PASSTHROUGH` | 空 | 额外透传给 worker 的环境变量名（逗号分隔）。默认只传 `PATH/HOME/LANG/代理/CURSOR_*/WB_*` 等，且丢弃含 `TOKEN/SECRET/KEY/AUTH` 的名字 |
 | `adminPort` / `CURSOR_BRIDGE_ADMIN_PORT` | `0`（关闭） | 开启后提供 `/healthz` `/stats` `/jobs`（仅监听 127.0.0.1） |
 | `adminShutdownToken` / `CURSOR_BRIDGE_ADMIN_SHUTDOWN_TOKEN` | 空 | **未设置时 `/admin/shutdown` 直接禁用（503）**；设置后必须 `POST` + `X-Shutdown-Token` 头（不再接受 query token） |

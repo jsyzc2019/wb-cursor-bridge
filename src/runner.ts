@@ -166,9 +166,17 @@ export class JobManager {
     };
   }
 
-  /** Snapshot for a caller, optionally with only events after `since`. */
+  /**
+   * Snapshot for a caller, optionally with only events after `since`.
+   *
+   * P1 (token efficiency): with `compactStatus` enabled, an incremental poll
+   * (`since > 0`) omits large stable fields the caller already received in full
+   * on its `since=0` response. Nothing is lost — the complete view is always
+   * one `since=0` call away. With the switch off (the default), or on a
+   * `since=0` call, this returns the exact v0.6.0 object unchanged.
+   */
   view(job: Job, since = 0): JobView {
-    return {
+    const full: JobView = {
       jobId: job.id,
       status: job.status,
       tier: job.tier,
@@ -196,6 +204,50 @@ export class JobManager {
           ? `reply with cursor_reply jobId=${job.id} to resume the same task`
           : undefined,
     };
+    return this.compactIncrementalView(full, since);
+  }
+
+  /**
+   * Build the opt-in compact view for an incremental poll.
+   *
+   * Only `result` and `artifacts` are eligible: both are stable derived values
+   * with no action-required meaning. `pendingInput`, `next`, `events` and
+   * `cursor` are always kept — dropping them would break the polling contract,
+   * not just save bytes. The decision uses the CURRENT value's size, never a
+   * change history, so a stateless bridge can never wrongly assume a field is
+   * unchanged.
+   */
+  private compactIncrementalView(full: JobView, since: number): JobView {
+    if (!this.cfg.compactStatus || since <= 0) return full;
+
+    const OMIT_THRESHOLD_BYTES = 1024;
+    const jsonBytes = (value: unknown): number =>
+      value === undefined ? 0 : Buffer.byteLength(JSON.stringify(value), 'utf8');
+
+    const omitted: Array<'result' | 'artifacts'> = [];
+    const omittedBytes: { result?: number; artifacts?: number } = {};
+    const resultBytes = jsonBytes(full.result);
+    const artifactBytes = jsonBytes(full.artifacts);
+    if (resultBytes > OMIT_THRESHOLD_BYTES) {
+      omitted.push('result');
+      omittedBytes.result = resultBytes;
+    }
+    if (artifactBytes > OMIT_THRESHOLD_BYTES) {
+      omitted.push('artifacts');
+      omittedBytes.artifacts = artifactBytes;
+    }
+    // Short tasks stay byte-for-byte identical: nothing is omitted until a
+    // field is actually large enough to justify the explanation overhead.
+    if (omitted.length === 0) return full;
+
+    const compact: JobView = { ...full };
+    if (omittedBytes.result !== undefined) delete compact.result;
+    if (omittedBytes.artifacts !== undefined) delete compact.artifacts;
+    compact.omitted = omitted;
+    compact.omittedBytes = omittedBytes;
+    compact.fullView = `call cursor_status with jobId=${full.jobId} and no since (or since=0)`;
+    compact.compact = true;
+    return compact;
   }
 
   start(opts: StartJobOptions): Job {

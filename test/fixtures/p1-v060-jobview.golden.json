@@ -1,0 +1,59 @@
+{
+  "jobId": "p1-golden-job",
+  "status": "completed",
+  "tier": "consult",
+  "workspace": "/srv/repo",
+  "exitCode": 0,
+  "durationMs": 1000,
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "finishedAt": "2026-01-01T00:00:01.000Z",
+  "result": "FAKE_RESULT:ok",
+  "truncated": false,
+  "isolation": "none",
+  "changedFiles": [
+    "src/index.ts"
+  ],
+  "diffStat": " 1 file changed, 1 insertion(+)",
+  "artifacts": [
+    {
+      "artifactId": "p1-golden-job-files",
+      "name": "changedFiles",
+      "parts": [
+        {
+          "kind": "data",
+          "data": {
+            "files": [
+              "src/index.ts"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "artifactId": "p1-golden-job-diffstat",
+      "name": "diffStat",
+      "parts": [
+        {
+          "kind": "text",
+          "text": " 1 file changed, 1 insertion(+)"
+        }
+      ]
+    }
+  ],
+  "droppedEvents": 0,
+  "events": [
+    {
+      "seq": 1,
+      "ts": "2026-01-01T00:00:00.100Z",
+      "type": "start",
+      "text": "started"
+    },
+    {
+      "seq": 2,
+      "ts": "2026-01-01T00:00:00.900Z",
+      "type": "assistant",
+      "text": "done"
+    }
+  ],
+  "cursor": 2
+}
