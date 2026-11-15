@@ -13,31 +13,50 @@
 
 ## 一键安装（Windows）
 
-1. 解压 `wb-cursor-bridge-v<version>-win-x64.zip`（例如 `wb-cursor-bridge-v0.4.0-win-x64.zip`）
-2. 在解压目录执行：
+1. 解压 `wb-cursor-bridge-v<version>-win-x64.zip`
+2. **双击解压目录里的 `install.cmd`** —— 装完，全程不用填任何东西。
+
+就这样。没有参数、没有提示、不需要预先准备目录。安装器会自动创建一个专用
+工作区 `%USERPROFILE%\wb-cursor-bridge-workspace`，子 agent 只能访问它
+（**白名单 fail-closed**，不会开放整个用户目录或盘符）。
+
+想让子 agent 处理**你自己的仓库**时，才需要唯一那个可选参数：
 
 ```powershell
-# 交互式（会提示输入仓库路径）
-powershell -ExecutionPolicy Bypass -File install.ps1
-
-# 或一次性给全参数
-powershell -ExecutionPolicy Bypass -File install.ps1 `
-  -WorkspaceRoots "C:\src\api;C:\src\web" `
-  -MaxConcurrency 4 -TimeoutSec 900
+powershell -ExecutionPolicy Bypass -File install.ps1 -WorkspaceRoots "C:\src\api;C:\src\web"
 ```
+
+> 指定的目录**必须已存在**；填错或不存在会明确报错并告诉你怎么办，不会静默
+> 建一个空目录。上面的 `C:\src\api` 只是示例，换成你机器上真实的路径。
+> 多个目录用分号 `;` 分隔。
 
 安装器会：
 
 | 步骤 | 行为 |
 |---|---|
-| 校验 | 工作区根目录存在；拒绝非法路径 |
+| 工作区 | 未指定则用自动创建的专用隔离目录；指定则逐个校验存在，拒绝非法路径 |
 | 运行时 | 复用 PATH 上的 Node 18+；没有则用 `-BundleNode` 下载私有运行时 |
 | Cursor | 自动探测 `agent.exe`，探测不到只告警不失败 |
 | 配置 | 写入 `%LOCALAPPDATA%\wb-cursor-bridge\config.json` |
 | 注册 | 同时注册到 WorkBuddy/CodeBuddy（`~/.codebuddy/.mcp.json`）与 Cursor（`~/.cursor/mcp.json`），**保留原有条目并自动备份** |
 | 自检 | 启动一次 bridge 并输出健康报告 |
 
-常用参数：`-BundleNode`、`-SkipMcp`、`-Force`、`-AdminPort 7801`、`-CursorBin <path>`、`-NodeVersion v22.12.0`、`-AdminShutdownToken <token>`、`-NodeMirror <url>`、`-NodeOfflinePackage <zip>`。
+<details>
+<summary>高级可选参数（一般完全用不到，全部有默认值）</summary>
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-WorkspaceRoots` | 自动创建的专用隔离目录 | 唯一可能需要主动指定的参数；分号分隔的允许仓库根 |
+| `-MaxConcurrency` / `-TimeoutSec` | 4 / 900 | 并发上限 / 单任务墙钟上限（秒） |
+| `-BundleNode` | 关 | 下载私有 Node 运行时（离线部署用） |
+| `-NodeOfflinePackage` | — | 预下载 node zip，指定后跳过网络 |
+| `-NodeVersion` / `-NodeMirror` | v22.11.0 / nodejs.org | 运行时版本与镜像 |
+| `-CursorBin` | 自动探测 | Cursor CLI 完整路径 |
+| `-InstallDir` | `%LOCALAPPDATA%\Programs\...` | 安装位置 |
+| `-AdminPort` / `-AdminShutdownToken` | 0 / 空 | 非 0 时开 `/healthz` `/stats` `/jobs`；token 不设则 `/admin/shutdown` 禁用 |
+| `-SkipMcp` / `-Force` / `-NoSelfCheck` | 关 | 跳过注册 / 强制覆盖 / 跳过自检 |
+
+</details>
 
 卸载：
 
@@ -271,8 +290,9 @@ src/
     ndjson.ts       增量 JSON 行读取
 scripts/
   build-release.mjs 单文件打包 + ZIP（自实现 zip writer，零依赖）
-  install.ps1       一键安装
+  install.ps1       一键安装（零参数；仅指定工作目录时才需 -WorkspaceRoots）
   uninstall.ps1     卸载
+  (install.cmd)     发布包内生成的双击入口，不入库
   lib/              安装器共享库（MCP 配置合并）
 ```
 
@@ -282,6 +302,9 @@ scripts/
 
 | 现象 | 处理 |
 |---|---|
+| 安装报 `找不到与参数名称 "WorkspaceRoots" 匹配的参数` | 命令漏了 `-ExecutionPolicy Bypass -File`，或参数名在复制时丢失。**直接双击 `install.cmd`** 即可，不必手敲命令 |
+| 安装报 `Workspace root does not exist: <path>` | 指定的目录不存在。先建好该目录再重跑，或**不带 `-WorkspaceRoots`** 让安装器使用默认隔离目录 |
+| 装完不知道工作区在哪 | 默认 `%USERPROFILE%\wb-cursor-bridge-workspace`；安装结束会打印。要换成自己的仓库就重跑并带 `-WorkspaceRoots` |
 | `cursor binary not found` | `bridge_health` 会指出探测路径；用 `-CursorBin` 或 `CURSOR_BIN` 指定 |
 | `outside every configured root` | 任务路径不在白名单内，检查 `workspaceRoots` |
 | `concurrency limit reached` | 调高 `maxConcurrency`，或等在途任务结束 |
@@ -303,6 +326,9 @@ scripts/
 
 | 版本 | 要点 |
 |---|---|
+| **0.6.2** | 一键傻瓜式安装：零参数零交互、自动专用隔离工作区、新增双击 `install.cmd`；`-WorkspaceRoots` 成为唯一可选参数；高级参数收进折叠区 |
+| **0.6.1** | 轮询增量视图（`CURSOR_BRIDGE_COMPACT_STATUS`，默认关闭，`since=0` 全文取回） |
+| **0.6.0** | A2A v1.0 完整契约与多绑定合规（JSON-RPC + HTTP+JSON，官方 TCK 门禁） |
 | **0.4.3** | 工程门禁：ESLint 接入 `verify`/`prepublishOnly`；Windows CI 补齐 a2a/stress/fault（新增 `resolveSpawnTarget`，Windows 上以当前 Node 执行 `.mjs` 假 Agent，绕开 `.cmd` 无法无 shell spawn 的限制）；修掉一个一直空转的 worktree 泄漏断言，130 项测试 |
 | **0.4.2** | 非法配置不再静默回退（`=15m` 以前会变成 900s）、CORS 通配不再授予凭证、多实例共享 stateDir 不再互删 worktree（`worktrees/<instanceId>/` + `owner.json`，`index.json` 记 owner 避免误判孤儿），129 项测试 |
 | **0.4.1** | 修复 `input-required` 暂停期丢失已写文件（续跑前自动回放暂停时的 patch，失败则 fail closed 而非在残缺树上继续）+ patch 产物持久化（桥重启后仍可续跑）+ `captureDiff --binary` + 续跑拒绝静默换档 + 流式缓冲硬上限 + blocking 断连不再空转，110 项测试 |

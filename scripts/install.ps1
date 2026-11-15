@@ -12,8 +12,11 @@
   the protocol.
 
 .PARAMETER WorkspaceRoots
-  Semicolon-separated list of repository roots the sub-agent may touch.
-  Anything outside these roots is refused.
+  OPTIONAL. Semicolon-separated list of repository roots the sub-agent may
+  touch; anything outside these roots is refused (fail-closed allowlist).
+  Omit it entirely for a one-click install: a single isolated default
+  workspace (%USERPROFILE%\wb-cursor-bridge-workspace) is created and used.
+  Only pass this when you want the sub-agent to work on your own repos.
 
 .PARAMETER CursorBin
   Full path to the Cursor CLI (agent.exe). Auto-detected when omitted.
@@ -31,6 +34,12 @@
   exists, the installer skips the network download entirely.
 
 .EXAMPLE
+  # One-click install: no parameters, no prompts. Uses an isolated default
+  # workspace and finishes unattended.
+  powershell -ExecutionPolicy Bypass -File install.ps1
+
+.EXAMPLE
+  # Only when you want your own repos instead of the default workspace.
   powershell -ExecutionPolicy Bypass -File install.ps1 -WorkspaceRoots "C:\src\api;C:\src\web"
 
 .EXAMPLE
@@ -129,13 +138,23 @@ if (Test-Path $sumsFile) {
   Write-Warn 'SHA256SUMS not present in the payload; skipping integrity check'
 }
 
+# One-click default: a single dedicated directory under the user's profile.
+# The allowlist stays fail-closed (the sub-agent may touch only this directory);
+# we remove the interactive prompt that used to block a plain `install.ps1`
+# with "Workspace root does not exist". Operators who need their own repos pass
+# -WorkspaceRoots explicitly - that is the ONLY parameter a user ever needs.
+$DefaultWorkspace = Join-Path $env:USERPROFILE 'wb-cursor-bridge-workspace'
+$usedDefaultWorkspace = $false
+
 if (-not $WorkspaceRoots -or $WorkspaceRoots.Count -eq 0) {
-  Write-Step 'No workspace roots supplied'
-  $raw = Read-Host 'Repository roots the sub-agent may access (separate several with ";")'
-  $WorkspaceRoots = $raw -split ';' | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }
-  if (-not $WorkspaceRoots -or $WorkspaceRoots.Count -eq 0) {
-    throw 'At least one workspace root is required. Re-run with -WorkspaceRoots "C:\src\repo".'
+  Write-Step 'No -WorkspaceRoots supplied - using the default isolated workspace'
+  if (-not (Test-Path $DefaultWorkspace -PathType Container)) {
+    New-Item -ItemType Directory -Path $DefaultWorkspace -Force | Out-Null
   }
+  $WorkspaceRoots = @($DefaultWorkspace)
+  $usedDefaultWorkspace = $true
+  Write-Ok "default workspace: $DefaultWorkspace"
+  Write-Info 'Put your repos there, or re-run with -WorkspaceRoots "C:\path\to\repo" to target your own.'
 }
 
 $WorkspaceRoots = $WorkspaceRoots | ForEach-Object {
@@ -148,7 +167,7 @@ $WorkspaceRoots = $WorkspaceRoots | ForEach-Object {
 
 foreach ($r in $WorkspaceRoots) {
   if (-not (Test-Path $r -PathType Container)) {
-    throw "Workspace root does not exist: $r"
+    throw "Workspace root does not exist: $($r)`n  Create that directory first, then re-run; OR run install.ps1 without -WorkspaceRoots to use the default isolated workspace ($($DefaultWorkspace))."
   }
 }
 
@@ -404,9 +423,15 @@ Write-Log "install completed node=$nodeExe roots=$($WorkspaceRoots -join ';')"
 Write-Host ''
 Write-Host 'Installation complete.' -ForegroundColor Green
 Write-Host ''
+$firstRoot = $WorkspaceRoots[0]
 Write-Host 'Next steps:'
 Write-Host "  1. Restart WorkBuddy/CodeBuddy and Cursor so they reload the MCP config."
-Write-Host "  2. In WorkBuddy ask:  'use cursor-bridge to review my repo at $WorkspaceRoots[0]'"
+Write-Host "  2. In WorkBuddy ask:  'use cursor-bridge to review my repo at $firstRoot'"
+if ($usedDefaultWorkspace) {
+  Write-Host "     Workspace root is the isolated default: $firstRoot"
+  Write-Host '     To target your own repos instead, re-run:'
+  Write-Host '       powershell -ExecutionPolicy Bypass -File install.ps1 -WorkspaceRoots "C:\path\to\repo"'
+}
 Write-Host "  3. Diagnostics:  & '$nodeExe' '$InstallDir\lib\index.mjs'  (then call bridge_health)"
 if ($AdminPort -gt 0) {
   Write-Host "  4. Health endpoint: http://127.0.0.1:$AdminPort/healthz"

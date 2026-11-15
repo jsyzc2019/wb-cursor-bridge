@@ -1,5 +1,35 @@
 # 更新日志
 
+## 0.6.2 — 一键傻瓜式安装（零参数、零交互）
+
+安装器此前要求用户理解并提供 `-WorkspaceRoots`（且路径必须已存在），并以
+`Read-Host` 交互提示阻断无参数安装；实际使用中易因命令参数丢失或目录不存在
+而报错。本版把安装收敛为「双击即可，除非要指定自己的工作目录」。
+
+- **零参数一键安装**：`install.ps1` 不再 `Read-Host`，无参数时自动创建并采用
+  单个专用隔离目录 `%USERPROFILE%\wb-cursor-bridge-workspace`，全程无提示、
+  无阻断。**白名单仍 fail-closed**：只开放这一个目录，绝不扩大到整个用户
+  目录或盘符。
+- **唯一可选参数**：`-WorkspaceRoots "C:\path\to\repo"` 语义不变，仅当用户要
+  让子 agent 处理自己的仓库时才需要；显式指定但不存在的目录改为可操作报错
+  （提示先创建目录，或不带参数改用默认隔离目录），不再是一条裸 `throw`。
+- **双击入口**：发布包新增 `install.cmd`，双击即以安全默认值安装；`%*` 透传
+  可选参数，`pause` 让窗口保留输出，带参数时自动跳过以免阻塞脚本化安装。
+  进入 `SHA256SUMS` 清单与 zip，受完整性校验覆盖。
+- **收起认知负担**：README 与使用手册改为「双击 / 一条零参数命令」为主，
+  `-MaxConcurrency` / `-TimeoutSec` 等高级参数移入可选区（能力与默认值不变，
+  纯文档调整，不为改而改）。修正安装完成提示里 `$WorkspaceRoots[0]` 的
+  字符串插值缺陷，并明确打印默认工作区路径与换目录命令。
+- **验证**：新增 `test/install-contract.test.mjs` 静态锁定「零交互 / 默认
+  隔离目录 / 可操作报错 / install.cmd 入包」契约；并借 `dotnet tool` 装上
+  PowerShell 7.2.23，用与 CI 一致的 `Parser::ParseFile` 做语法解析（3 个脚本
+  全过），再从真实 `install.ps1` 抽取工作区解析块**实跑**三个场景：零参数
+  自动建目录、重复运行幂等、显式不存在目录抛可操作错误。PowerShell 语法在
+  CI windows job 另有解析门禁。**唯一未覆盖的是完整双击安装链路**（写 MCP
+  配置 / 下载 Node / 自检），仍需在目标 Windows 机器上确认。
+- **门禁**：`npm test`、`npm run verify` 8 阶段、官方 A2A TCK 双 transport、
+  card scan、MCP / gRPC PoC、`build:release` 全绿。
+
 ## 0.6.1 — 轮询增量视图（opt-in，默认关闭）
 
 **默认行为零变化**：`CURSOR_BRIDGE_COMPACT_STATUS` 默认 `false`，关闭时

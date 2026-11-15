@@ -165,6 +165,26 @@ if exist "%HERE%runtime\\node.exe" (
 exit /b %ERRORLEVEL%
 `;
 
+/**
+ * One-click installer: double-click install.cmd and the bridge installs with
+ * zero parameters and zero prompts. %* forwards optional arguments for the one
+ * case a user needs them (-WorkspaceRoots "C:\\path\\to\\repo"). The trailing
+ * pause keeps the console window open so a double-click user can actually read
+ * "Installation complete" / any error; it is skipped when args were passed so
+ * scripted installs never block.
+ */
+const INSTALL_CMD = `@echo off
+rem wb-cursor-bridge one-click installer (win-x64)
+rem Double-click to install with safe defaults. Optional:
+rem   install.cmd -WorkspaceRoots "C:\\path\\to\\repo"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1" %*
+set "RC=%ERRORLEVEL%"
+if not "%~1"=="" exit /b %RC%
+echo.
+pause
+exit /b %RC%
+`;
+
 async function main() {
   const version = JSON.parse(
     fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'),
@@ -214,6 +234,7 @@ async function main() {
   // 2. Scripts and docs.
   fs.writeFileSync(path.join(STAGE, 'launcher.cmd'), LAUNCHER, 'utf8');
   fs.writeFileSync(path.join(STAGE, 'verify.cmd'), VERIFY, 'utf8');
+  fs.writeFileSync(path.join(STAGE, 'install.cmd'), INSTALL_CMD, 'utf8');
   copyIntoStage('scripts/install.ps1', 'install.ps1');
   copyIntoStage('scripts/uninstall.ps1', 'uninstall.ps1');
   // install.ps1 and uninstall.ps1 dot-source this, so it must ship with them.
@@ -333,7 +354,7 @@ async function main() {
     `  archive     : ${zipFile} (${(zipSize / 1024).toFixed(0)} KB)`,
     `  sha256      : ${zipHash}`,
     '',
-    'Next: extract the zip on the target Windows machine and run install.ps1.',
+    'Next: extract the zip on the target Windows machine and double-click install.cmd.',
     '',
   ].join('\n');
   fs.writeFileSync(path.join(OUT, 'BUILD-REPORT.txt'), report, 'utf8');
